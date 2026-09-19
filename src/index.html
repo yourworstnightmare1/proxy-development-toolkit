@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Proxy Development Toolkit</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="chrome menu-mode" id="chrome">
+    <div class="nav session-chrome">
+      <button id="back" type="button" title="Back" aria-label="Back">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5.5 8 12l6.5 6.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <button id="forward" type="button" title="Forward" aria-label="Forward">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.5 5.5 16 12l-6.5 6.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <button id="reload" type="button" title="Reload" aria-label="Reload">
+        <svg id="reload-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M19 12a7 7 0 1 1-2-4.9M19 4v5h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+    </div>
+    <form id="omnibox" class="omnibox session-chrome">
+      <input id="address" type="text" spellcheck="false" placeholder="Destination URL" autocomplete="off" />
+    </form>
+    <button id="sidebar-toggle" type="button" class="session-chrome" title="Info" aria-label="Toggle info">Info</button>
+    <button id="settings-toggle" type="button" title="Settings" aria-label="Settings" aria-expanded="false" aria-controls="settings-page">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.5.5 0 0 0 .12-.61l-1.92-3.32a.5.5 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94L14.4 2.81a.5.5 0 0 0-.48-.41h-3.84a.5.5 0 0 0-.47.41L9.25 5.35c-.59.24-1.13.56-1.62.94l-2.39-.96a.5.5 0 0 0-.59.22L2.74 8.87a.5.5 0 0 0 .12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.5.5 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.5.5 0 0 0-.12-.61l-2.03-1.58zM12 15.6A3.6 3.6 0 1 1 15.6 12 3.6 3.6 0 0 1 12 15.6z"/></svg>
+    </button>
+  </header>
+  <div id="tab-strip" class="tab-strip hidden" aria-label="Browser tabs">
+    <div id="tab-list" class="tab-list"></div>
+    <button id="tab-new" type="button" title="New tab">+</button>
+  </div>
+
+  <div class="workspace">
+    <section id="settings-page" class="settings-page hidden" aria-label="Settings">
+      <div class="settings-shell">
+        <aside class="settings-nav" aria-label="Settings categories">
+          <div class="settings-nav-head">
+            <h1>Settings</h1>
+            <button id="settings-close" type="button">Close</button>
+          </div>
+          <div class="settings-nav-search">
+            <input id="settings-search" type="search" placeholder="Search settings…" autocomplete="off" spellcheck="false" />
+          </div>
+          <div id="settings-search-results" class="settings-search-results hidden" role="listbox" aria-label="Matching settings"></div>
+          <button type="button" class="nav-item active" data-section="proxy">
+            <img class="nav-icon" src="/icons/proxy.svg" alt="" />
+            <span>Proxy &amp; Web</span>
+          </button>
+          <button type="button" class="nav-item" data-section="browser">
+            <img class="nav-icon" src="/icons/browser.svg" alt="" />
+            <span>Browser</span>
+          </button>
+          <button type="button" class="nav-item" data-section="security">
+            <img class="nav-icon" src="/icons/security.svg" alt="" />
+            <span>Security</span>
+          </button>
+          <button type="button" class="nav-item" data-section="developer">
+            <img class="nav-icon" src="/icons/developer.svg" alt="" />
+            <span>Developer</span>
+          </button>
+          <button type="button" class="nav-item" data-section="mcp">
+            <img class="nav-icon" src="/icons/add-link.svg" alt="" />
+            <span>MCP/Server</span>
+          </button>
+          <button type="button" class="nav-item" data-section="about">
+            <img class="nav-icon" src="/icons/about.svg" alt="" />
+            <span>About</span>
+          </button>
+        </aside>
+        <div class="settings-main">
+          <p id="settings-banner" class="status" role="status"></p>
+
+          <section id="section-proxy" class="settings-section active">
+            <h2>Proxy &amp; Web</h2>
+            <p class="section-desc">Manage web proxies, transport methods, and Wisp configuration</p>
+
+            <h3>Ultraviolet</h3>
+            <label>Ultraviolet Version
+              <span class="hint">Choose the version of Ultraviolet you want to use in the testing environment. It is recommended you always use the latest one as that is what most sites use.</span>
+              <span class="version-row">
+                <select id="uv-version"></select>
+                <button id="uv-download" type="button" class="hidden">Download</button>
+              </span>
+            </label>
+            <p id="uv-version-note" class="status"></p>
+            <label>Ultraviolet Port
+              <span class="hint">Choose the local port you want Ultraviolet to be hosted on.</span>
+              <input id="uv-port" type="text" inputmode="numeric" spellcheck="false" placeholder="8080" autocomplete="off" />
+            </label>
+            <p id="uv-port-note" class="status"></p>
+
+            <h3>Scramjet</h3>
+            <label>Scramjet Version
+              <span class="hint">Choose the version of Scramjet you want to use in the testing environment. It is recommended you always use the latest one as that is what most sites use.</span>
+              <span class="version-row">
+                <select id="sj-version"></select>
+                <button id="sj-download" type="button" class="hidden">Download</button>
+              </span>
+            </label>
+            <p id="sj-version-note" class="status"></p>
+            <label>Scramjet Port
+              <span class="hint">Choose the local port you want Scramjet to be hosted on.</span>
+              <input id="sj-port" type="text" inputmode="numeric" spellcheck="false" placeholder="3000" autocomplete="off" />
+            </label>
+            <p id="sj-port-note" class="status"></p>
+
+            <h3>Wisp</h3>
+            <fieldset>
+              <legend>Host Wisp Locally</legend>
+              <p class="hint">Host a Wisp server on a local IP. Useful if you want this device as a Wisp service over the local network, then connect another device via the IP instead of a public domain.</p>
+              <div class="choices">
+                <label class="choice"><input type="radio" name="wisp-host" value="enabled" /> Enabled</label>
+                <label class="choice"><input type="radio" name="wisp-host" value="disabled" checked /> Disabled</label>
+              </div>
+            </fieldset>
+            <label>Wisp IP Address
+              <span class="hint">This is the address Wisp is hosting on. You can connect to this on another device that can connect to Wisp.</span>
+              <input id="wisp-address" type="text" readonly />
+            </label>
+            <label>Wisp Port
+              <span class="hint">Choose the port you want Wisp hosted on. Does nothing if Host Wisp Locally is disabled.</span>
+              <input id="wisp-port" type="text" inputmode="numeric" spellcheck="false" placeholder="Port" autocomplete="off" />
+            </label>
+            <p id="wisp-port-note" class="status"></p>
+            <fieldset>
+              <legend>Log Wisp Traffic</legend>
+              <p class="hint">Log all network traffic passed through your Wisp host. Useful for debugging network issues on your site.</p>
+              <div class="choices">
+                <label class="choice"><input type="radio" name="wisp-log" value="enabled" checked /> Enabled</label>
+                <label class="choice"><input type="radio" name="wisp-log" value="disabled" /> Disabled</label>
+              </div>
+            </fieldset>
+          </section>
+
+          <section id="section-browser" class="settings-section">
+            <h2>Browser</h2>
+            <p class="section-desc">Edit user agent, reported screen resolution, and more</p>
+
+            <label>User Agent
+              <span class="hint">Change what device the development browser reports to sites you connect to. This can change how the site looks or functions based on the device you set (ex. setting your user agent to a mobile device will make the site show the mobile version, etc.).</span>
+            </label>
+            <div class="pair">
+              <label>OS
+                <select id="ua-os">
+                  <option value="Windows">Windows</option>
+                  <option value="macOS">macOS</option>
+                  <option value="Linux">Linux</option>
+                  <option value="Android">Android</option>
+                  <option value="iOS">iOS</option>
+                  <option value="Custom">Custom String</option>
+                </select>
+              </label>
+              <label>Browser
+                <select id="ua-browser">
+                  <option value="Chrome">Chrome</option>
+                  <option value="Edge">Edge</option>
+                  <option value="Safari">Safari</option>
+                  <option value="Firefox">Firefox</option>
+                  <option value="Opera">Opera</option>
+                  <option value="Internet Explorer">Internet Explorer</option>
+                  <option value="Custom">Custom String</option>
+                </select>
+              </label>
+            </div>
+            <label id="ua-custom-os-wrap" class="hidden">Custom OS string
+              <input id="ua-custom-os" type="text" spellcheck="false" />
+            </label>
+            <label id="ua-custom-browser-wrap" class="hidden">Custom browser string
+              <input id="ua-custom-browser" type="text" spellcheck="false" />
+            </label>
+            <p id="ua-preview" class="status"></p>
+
+            <label>Reported Screen Resolution
+              <span class="hint">Change the screen resolution the development browser reports to sites you connect to. This can change how the site looks or functions based on the resolution you set (ex. setting your resolution too small may cause the site to not display).</span>
+            </label>
+            <fieldset>
+              <legend>Orientation</legend>
+              <div class="choices">
+                <label class="choice"><input type="radio" name="screen-orientation" value="landscape" checked /> Landscape</label>
+                <label class="choice"><input type="radio" name="screen-orientation" value="portrait" /> Portrait</label>
+              </div>
+            </fieldset>
+            <div class="pair">
+              <label>Width
+                <input id="screen-width" type="number" min="1" step="1" />
+              </label>
+              <label>Height
+                <input id="screen-height" type="number" min="1" step="1" />
+              </label>
+            </div>
+
+            <fieldset>
+              <legend>Allow Multiple Tabs (Beta)</legend>
+              <p class="hint">Allow multiple tabs to be used. This is not recommended as it can significantly increase memory usage, especially when Split View is enabled.</p>
+              <div class="choices">
+                <label class="choice"><input type="radio" name="multi-tabs" value="enabled" /> Enabled</label>
+                <label class="choice"><input type="radio" name="multi-tabs" value="disabled" checked /> Disabled</label>
+              </div>
+            </fieldset>
+
+            <fieldset>
+              <legend>Allow URL Modification</legend>
+              <p class="hint">Allow changing the URL in the omnibox.</p>
+              <div class="choices">
+                <label class="choice"><input type="radio" name="url-mod" value="yes" checked /> Yes</label>
+                <label class="choice"><input type="radio" name="url-mod" value="no" /> No</label>
+              </div>
+            </fieldset>
+
+            <fieldset>
+              <legend>Allow Site Redirects</legend>
+              <p class="hint">Allows the site you're on to redirect you to another site (in same tab or new tab).</p>
+              <div class="choices">
+                <label class="choice"><input type="radio" name="site-redirects" value="yes" checked /> Yes</label>
+                <label class="choice"><input type="radio" name="site-redirects" value="no" /> No</label>
+              </div>
+            </fieldset>
+          </section>
+
+          <section id="section-security" class="settings-section">
+            <h2>Security</h2>
+            <p class="section-desc">Manage site permissions, site security, and preset security options</p>
+
+            <label>Site Permissions
+              <span class="hint">Edit the permissions the sites you visit are allowed to have.</span>
+            </label>
+            <div class="permissions-toolbar">
+              <input id="perm-origin" type="text" placeholder="https://example.com" spellcheck="false" />
+              <select id="perm-kind">
+                <option value="notifications">notifications</option>
+                <option value="geolocation">geolocation</option>
+                <option value="media">media</option>
+                <option value="microphone">microphone</option>
+                <option value="camera">camera</option>
+                <option value="clipboard-read">clipboard-read</option>
+                <option value="clipboard-sanitized-write">clipboard-write</option>
+                <option value="pointerLock">pointerLock</option>
+                <option value="fullscreen">fullscreen</option>
+              </select>
+              <select id="perm-action">
+                <option value="ask">Ask</option>
+                <option value="allow">Allow</option>
+                <option value="deny">Deny</option>
+              </select>
+              <button id="perm-add" type="button">Add</button>
+            </div>
+            <table class="permissions-table" id="permissions-table">
+              <thead>
+                <tr><th>Site</th><th>Permission</th><th>Action</th><th></th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+
+            <fieldset>
+              <legend>Force HTTPS</legend>
+              <p class="hint">Force all sites to send requests via HTTPS, which is significantly more secure and better than HTTP.</p>
+              <div class="choices">
+                <label class="choice"><input type="radio" name="force-https" value="yes" checked /> Yes</label>
+                <label class="choice"><input type="radio" name="force-https" value="no" /> No (Not recommended)</label>
+              </div>
+            </fieldset>
+
+            <fieldset>
+              <legend>Allow Saving to IndexedDB</legend>
+              <p class="hint">Allow the sites you visit to save data to the browser's IndexedDB, or local storage. Disabling this will not allow sites to save user data and may act like you've never visited before.</p>
+              <div class="choices">
+                <label class="choice"><input type="radio" name="indexeddb" value="yes" checked /> Yes</label>
+                <label class="choice"><input type="radio" name="indexeddb" value="no" /> No</label>
+              </div>
+            </fieldset>
+
+            <fieldset>
+              <legend>Allow Downloading</legend>
+              <p class="hint">Allow sites to download files to your computer. You will still always be notified and prompted if a site tries to download a file.</p>
+              <div class="choices">
+                <label class="choice"><input type="radio" name="allow-download" value="yes" checked /> Yes</label>
+                <label class="choice"><input type="radio" name="allow-download" value="no" /> No</label>
+              </div>
+            </fieldset>
+
+            <label>Default Download Location
+              <span class="hint">Choose the default location you want your downloads to be saved to. You will still always be notified and prompted if a site tries to download a file, the system file browser will just always open to this location by default when you accept the download request.</span>
+              <span class="version-row">
+                <input id="download-location" type="text" readonly />
+                <button id="download-location-pick" type="button">Choose…</button>
+              </span>
+            </label>
+          </section>
+
+          <section id="section-developer" class="settings-section">
+            <h2>Developer</h2>
+            <p class="section-desc">Manage Electron DevTools, browser/network logs, imported proxies, and more</p>
+
+            <div class="export-row">
+              <button id="export-browser" type="button">Export Browser Logs</button>
+              <button id="export-network" type="button">Export Network Logs</button>
+              <button id="export-proxy" type="button">Export Proxy Logs</button>
+              <button id="export-wisp" type="button">Export Wisp Logs</button>
+            </div>
+
+            <fieldset>
+              <legend>Enable Electron DevTools</legend>
+              <p class="hint">The entire browser's developer console at your fingertips, based on Chromium DevTools. You should never disable this, especially if you have MCP clients as they won't be able to access the console if this is off.</p>
+              <div class="choices">
+                <label class="choice"><input type="radio" name="devtools" value="enabled" checked /> Enabled</label>
+                <label class="choice"><input type="radio" name="devtools" value="disabled" /> Disabled</label>
+              </div>
+            </fieldset>
+
+            <fieldset>
+              <legend>Enable Logging</legend>
+              <p class="hint">Enable logging of network activity via the browser, DevTools console logs, performance logs, and the app's logs.</p>
+              <div class="log-checks">
+                <label class="choice"><input id="log-all" type="checkbox" checked /> Log All (recommended)</label>
+                <label class="choice"><input id="log-network" type="checkbox" checked /> Log Network Activity</label>
+                <label class="choice"><input id="log-console" type="checkbox" checked /> Log DevTools Console Activity</label>
+                <label class="choice"><input id="log-performance" type="checkbox" /> Log Performance Info</label>
+                <label class="choice"><input id="log-system" type="checkbox" /> Log System Info</label>
+                <label class="choice"><input id="log-application" type="checkbox" checked /> Log Application Info</label>
+              </div>
+            </fieldset>
+
+            <label>Log Location
+              <span class="hint">Choose where you want your enabled logs to save to.</span>
+              <span class="version-row">
+                <input id="log-location" type="text" readonly placeholder="In-memory only (no folder selected)" />
+                <button id="log-location-pick" type="button">Choose…</button>
+                <button id="log-location-clear" type="button">Clear</button>
+              </span>
+            </label>
+          </section>
+
+          <section id="section-mcp" class="settings-section">
+            <h2>MCP/Server</h2>
+            <p class="section-desc">Set up AI coding agents that can control and test your websites in the Proxy Development Toolkit</p>
+
+            <fieldset>
+              <legend>Enable MCP Server</legend>
+              <p class="hint">Start a local Model Context Protocol server so Cursor, Claude, Codex, and other agents can attach to this running app over loopback HTTP.</p>
+              <div class="choices">
+                <label class="choice"><input type="radio" name="mcp-enabled" value="enabled" /> Enabled</label>
+                <label class="choice"><input type="radio" name="mcp-enabled" value="disabled" checked /> Disabled</label>
+              </div>
+            </fieldset>
+
+            <label>MCP Port
+              <span class="hint">Loopback-only port for the MCP Streamable HTTP endpoint.</span>
+              <input id="mcp-port" type="text" inputmode="numeric" spellcheck="false" placeholder="7432" autocomplete="off" />
+            </label>
+            <p id="mcp-port-note" class="status"></p>
+
+            <label>Auth Token
+              <span class="hint">Agents must send this as Authorization: Bearer … Clients on this machine only; do not share it.</span>
+              <span class="version-row">
+                <input id="mcp-token" type="text" readonly spellcheck="false" />
+                <button id="mcp-token-copy" type="button">Copy</button>
+                <button id="mcp-token-regen" type="button">Regenerate</button>
+              </span>
+            </label>
+
+            <fieldset>
+              <legend>Allow Control Tools</legend>
+              <p class="hint">When enabled, agents can start sessions, navigate, and open Inspect. When disabled, agents can only read status, screenshots, and logs.</p>
+              <div class="choices">
+                <label class="choice"><input type="radio" name="mcp-control" value="enabled" checked /> Enabled</label>
+                <label class="choice"><input type="radio" name="mcp-control" value="disabled" /> Observe only</label>
+              </div>
+            </fieldset>
+
+            <label>Status
+              <span class="hint">The MCP server only runs while this app is open and MCP is enabled.</span>
+              <input id="mcp-status" type="text" readonly />
+            </label>
+
+            <label>Client setup
+              <span class="hint">Pick an agent to see its config snippet. Use Add for any other Streamable HTTP client.</span>
+            </label>
+            <div class="mcp-client-row" role="tablist" aria-label="MCP clients">
+              <button type="button" class="mcp-client-btn active" data-mcp-client="cursor" title="Cursor">
+                <img src="/icons/cursor.png" alt="" />
+                <span>Cursor</span>
+              </button>
+              <button type="button" class="mcp-client-btn" data-mcp-client="claude" title="Claude">
+                <img src="/icons/claude.png" alt="" />
+                <span>Claude</span>
+              </button>
+              <button type="button" class="mcp-client-btn" data-mcp-client="codex" title="Codex">
+                <img src="/icons/codex.png" alt="" />
+                <span>Codex</span>
+              </button>
+              <button type="button" class="mcp-client-btn" data-mcp-client="custom" title="Add another AI model">
+                <img src="/icons/add-link.svg" alt="" class="icon-tint" />
+                <span>Add</span>
+              </button>
+            </div>
+            <div id="mcp-custom-fields" class="mcp-custom-fields hidden">
+              <label>Model / client name
+                <input id="mcp-custom-name" type="text" placeholder="e.g. Windsurf, Cline, custom agent" spellcheck="false" />
+              </label>
+            </div>
+            <label>
+              <span id="mcp-snippet-title">Cursor mcp.json snippet</span>
+              <textarea id="mcp-snippet-active" class="mcp-snippet" readonly rows="12"></textarea>
+            </label>
+            <div class="export-row">
+              <button id="mcp-snippet-copy-active" type="button">Copy snippet</button>
+            </div>
+            <textarea id="mcp-snippet-cursor" class="hidden" readonly aria-hidden="true"></textarea>
+            <textarea id="mcp-snippet-claude" class="hidden" readonly aria-hidden="true"></textarea>
+            <textarea id="mcp-snippet-http" class="hidden" readonly aria-hidden="true"></textarea>
+            <p class="hint">If you change the port or token while the server is running, save settings to restart it with the new values.</p>
+          </section>
+
+          <section id="section-about" class="settings-section">
+            <h2>About</h2>
+            <p class="section-desc">App identity, build details, and third-party attributions</p>
+
+            <div class="about-brand">
+              <img class="about-logo" src="/icons/app.png" alt="" />
+              <div class="about-brand-text">
+                <h3 id="about-app-name">Proxy Development Toolkit</h3>
+                <p class="about-tagline">Scramjet · Ultraviolet · transports</p>
+              </div>
+            </div>
+
+            <dl class="about-meta">
+              <div><dt>Version</dt><dd id="about-version">—</dd></div>
+              <div><dt>Commit</dt><dd id="about-commit" title="">—</dd></div>
+              <div><dt>Build date</dt><dd id="about-build-date">—</dd></div>
+            </dl>
+
+            <div class="export-row">
+              <button id="about-attributions" type="button">Attributions</button>
+            </div>
+          </section>
+
+          <section id="section-attributions" class="settings-section">
+            <div class="about-attr-head">
+              <button id="attributions-back" type="button">← Back to About</button>
+              <h2>Attributions</h2>
+            </div>
+            <p class="section-desc">Open-source components used by the Proxy Development Toolkit</p>
+            <div id="attributions-list" class="attributions-list"></div>
+            <div id="attribution-license-panel" class="attribution-license-panel hidden">
+              <div class="about-attr-head">
+                <button id="attribution-license-back" type="button">← Back to list</button>
+                <h3 id="attribution-license-title">License</h3>
+              </div>
+              <pre id="attribution-license-text" class="attribution-license-text"></pre>
+            </div>
+          </section>
+        </div>
+      </div>
+    </section>
+    <main id="stage">
+      <section id="launcher" class="launcher">
+        <h1>Welcome to the Proxy Development Toolkit!</h1>
+        <p class="lede">Load a site through Scramjet or Ultraviolet and switch transports without leaving the window.</p>
+        <form id="launch-form" class="menu-form">
+          <div class="combo">
+            <input id="site-url" type="text" placeholder="https://example.com" spellcheck="false" autocomplete="off" />
+            <button type="button" class="arrow" aria-label="Site source" aria-haspopup="menu" aria-expanded="false" aria-controls="site-menu">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <div id="site-menu" class="menu hidden">
+              <button type="button" data-action="file">Select File...</button>
+              <button type="button" data-action="repo">Import Repository</button>
+            </div>
+          </div>
+          <input id="site-folder" type="hidden" />
+          <input id="site-subdir" class="hidden" type="text" placeholder="Optional subdirectory, such as dist" />
+
+          <div id="proxy-split" class="proxy-split hidden">
+            <div class="stack">
+              <span class="field-label" id="proxy-label-left">Left proxy</span>
+              <div class="combo" data-proxy-pane="left">
+                <select class="proxy-kind">
+                  <option value="scramjet">Scramjet</option>
+                  <option value="ultraviolet">Ultraviolet</option>
+                </select>
+                <input class="proxy-url hidden" type="text" placeholder="https://github.com/owner/proxy" spellcheck="false" />
+                <input class="proxy-folder hidden" type="text" readonly placeholder="Imported folder" />
+                <button type="button" class="arrow" aria-label="Left proxy source" aria-haspopup="menu" aria-expanded="false">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+                <div class="menu proxy-menu hidden">
+                  <button type="button" data-action="file">Select File...</button>
+                  <button type="button" data-action="repo">Import Repository</button>
+                  <button type="button" class="proxy-custom-clear hidden">Use bundled</button>
+                </div>
+              </div>
+            </div>
+            <div class="stack">
+              <span class="field-label" id="proxy-label-right">Right proxy</span>
+              <div class="combo" data-proxy-pane="right">
+                <select class="proxy-kind">
+                  <option value="ultraviolet" selected>Ultraviolet</option>
+                  <option value="scramjet">Scramjet</option>
+                </select>
+                <input class="proxy-url hidden" type="text" placeholder="https://github.com/owner/proxy" spellcheck="false" />
+                <input class="proxy-folder hidden" type="text" readonly placeholder="Imported folder" />
+                <button type="button" class="arrow" aria-label="Right proxy source" aria-haspopup="menu" aria-expanded="false">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+                <div class="menu proxy-menu hidden">
+                  <button type="button" data-action="file">Select File...</button>
+                  <button type="button" data-action="repo">Import Repository</button>
+                  <button type="button" class="proxy-custom-clear hidden">Use bundled</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="pair" id="proxy-transport-row">
+            <div id="proxy-single" class="combo" data-proxy-pane="single">
+              <select id="proxy-kind" class="proxy-kind">
+                <option value="scramjet">Scramjet</option>
+                <option value="ultraviolet">Ultraviolet</option>
+              </select>
+              <input class="proxy-url hidden" type="text" placeholder="https://github.com/owner/proxy" spellcheck="false" />
+              <input class="proxy-folder hidden" type="text" readonly placeholder="Imported folder" />
+              <button type="button" class="arrow" aria-label="Proxy source" aria-haspopup="menu" aria-expanded="false">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+              <div class="menu proxy-menu hidden">
+                <button type="button" data-action="file">Select File...</button>
+                <button type="button" data-action="repo">Import Repository</button>
+                <button type="button" class="proxy-custom-clear hidden">Use bundled</button>
+              </div>
+            </div>
+            <select id="transport">
+              <option value="epoxy-tls">epoxy-tls</option>
+              <option value="wisp-js">wisp-js</option>
+              <option value="libcurl-transport">libcurl-transport</option>
+              <option value="bare-transport">bare-transport</option>
+              <option value="bare-mux">bare-mux (legacy)</option>
+            </select>
+          </div>
+
+          <div id="wisp-field" class="stack">
+            <input id="wisp-url" type="text" placeholder="wss://wisp.mercurywork.shop/" spellcheck="false" />
+            <div class="presets">
+              <button type="button" data-wisp="wss://wisp.mercurywork.shop/">Mercury preset</button>
+              <button type="button" id="local-wisp">Local preset</button>
+            </div>
+            <label class="split-toggle">
+              <input id="enable-split" type="checkbox" />
+              Enable Split View
+            </label>
+            <div id="split-orientation-field" class="split-orientation hidden">
+              <span class="field-label">Split layout</span>
+              <div class="split-orientation-choices">
+                <label class="split-orientation-choice">
+                  <input type="radio" name="split-orientation" value="horizontal" checked />
+                  Left / Right
+                </label>
+                <label class="split-orientation-choice">
+                  <input type="radio" name="split-orientation" value="vertical" />
+                  Top / Bottom
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <div id="bare-field" class="hidden">
+            <input id="bare-url" type="url" placeholder="https://example.com/bare/" spellcheck="false" />
+            <label class="split-toggle">
+              <input id="enable-split-bare" type="checkbox" />
+              Enable Split View
+            </label>
+            <div id="split-orientation-field-bare" class="split-orientation hidden">
+              <span class="field-label">Split layout</span>
+              <div class="split-orientation-choices">
+                <label class="split-orientation-choice">
+                  <input type="radio" name="split-orientation-bare" value="horizontal" checked />
+                  Left / Right
+                </label>
+                <label class="split-orientation-choice">
+                  <input type="radio" name="split-orientation-bare" value="vertical" />
+                  Top / Bottom
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <p id="launch-status" class="status" role="status"></p>
+          <div class="start-row">
+            <img id="session-server-icon" class="session-server-icon" data-state="ready" src="/icons/server-ready.svg?v=2" alt="Ready to start" title="Ready to start" />
+            <button id="open-session" type="submit">Start Session</button>
+          </div>
+        </form>
+
+        <section class="ai-cta" aria-label="Developing with AI">
+          <p class="ai-cta-copy">Developing with AI? Click below to setup an MCP server so that your agents can test your site using the Proxy Development Toolkit.</p>
+          <button id="setup-mcp" type="button" class="ai-cta-btn">
+            <span class="ai-cta-icons" aria-hidden="true">
+              <img src="/icons/codex.png" alt="" />
+              <img src="/icons/claude.png" alt="" />
+              <img src="/icons/cursor.png" alt="" />
+              <img src="/icons/add-link.svg" alt="" class="icon-tint" />
+            </span>
+            <span>Setup MCP Server</span>
+          </button>
+        </section>
+      </section>
+      <div id="frame-wrap" class="frame-wrap hidden">
+        <iframe id="proxy-frame" title="Proxied site"></iframe>
+        <div id="split-frames" class="split-frames hidden">
+          <div class="split-pane" data-pane="left">
+            <div class="split-label" id="split-label-left">Left</div>
+            <iframe id="proxy-frame-left" title="Left proxy"></iframe>
+          </div>
+          <div class="split-divider" aria-hidden="true"></div>
+          <div class="split-pane" data-pane="right">
+            <div class="split-label" id="split-label-right">Right</div>
+            <iframe id="proxy-frame-right" title="Right proxy"></iframe>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <aside id="sidebar" class="sidebar collapsed">
+      <div id="sidebar-drag" class="sidebar-head" title="Drag to an edge or corner">
+        <h2>Info</h2>
+        <button id="collapse-sidebar" type="button">Collapse</button>
+      </div>
+      <section>
+        <h3>Live proxy settings</h3>
+          <label>Proxy
+            <select id="live-proxy">
+              <option value="scramjet">Scramjet</option>
+              <option value="ultraviolet">Ultraviolet</option>
+            </select>
+          </label>
+          <p id="live-proxy-split" class="status hidden"></p>
+        <label>Transport
+          <select id="live-transport">
+            <option value="epoxy-tls">epoxy-tls</option>
+            <option value="wisp-js">wisp-js</option>
+            <option value="libcurl-transport">libcurl-transport</option>
+            <option value="bare-transport">bare-transport</option>
+            <option value="bare-mux">bare-mux (legacy)</option>
+          </select>
+        </label>
+        <label id="live-wisp-label">Wisp URL
+          <input id="live-wisp" type="text" spellcheck="false" />
+        </label>
+        <label id="live-bare-label" class="hidden">Bare server
+          <input id="live-bare" type="url" spellcheck="false" />
+        </label>
+        <div class="row">
+          <button id="apply-live" type="button">Apply</button>
+          <button id="end-session" type="button">End session</button>
+        </div>
+        <p id="live-status" class="status"></p>
+      </section>
+      <section>
+        <h3>Session</h3>
+        <dl id="session-info"></dl>
+      </section>
+      <section class="stats">
+        <div class="row">
+          <h3>Network</h3>
+          <button id="stats-pause" type="button">Pause</button>
+          <button id="stats-clear" type="button">Clear</button>
+        </div>
+        <p id="stats-summary" class="status">No traffic yet.</p>
+        <ol id="stats-list"></ol>
+      </section>
+    </aside>
+    <div id="sidebar-resize" class="hidden" title="Drag to resize"></div>
+    <button id="inspect-grip" class="hidden" type="button" title="Drag Inspect to an edge or corner">Inspect</button>
+    <div id="inspect-resize" class="hidden" title="Drag to resize"></div>
+    <div id="snap-preview" class="hidden"></div>
+  </div>
+  <div id="repo-dialog" class="dialog-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="repo-title">
+    <form id="repo-form" class="dialog">
+      <h2 id="repo-title">Import Repository</h2>
+      <label>GitHub URL
+        <input id="repo-url" type="text" placeholder="https://github.com/owner/repo" spellcheck="false" required />
+      </label>
+      <label>Branch
+        <input id="repo-branch" type="text" value="main" spellcheck="false" autocomplete="off" required />
+      </label>
+      <p id="repo-status" class="status" role="status"></p>
+      <div class="dialog-actions">
+        <button id="repo-cancel" type="button">Cancel</button>
+        <button id="repo-pull" type="submit">Pull</button>
+      </div>
+    </form>
+  </div>
+  <script type="module" src="/app/app.js"></script>
+</body>
+</html>

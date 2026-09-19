@@ -1,0 +1,80 @@
+{
+  "name": "proxy-development-toolkit",
+  "productName": "Proxy Development Toolkit",
+  "version": "1.0.0",
+  "description": "Electron harness for testing sites through Scramjet, Ultraviolet, and interchangeable transports.",
+  "author": "yourworstnightmare1",
+  "license": "AGPL-3.0-only",
+  "main": "electron/main.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder",
+    "pack": "electron-builder --dir"
+  },
+  "dependencies": {
+    "@mercuryworkshop/bare-mux": "^2.1.8",
+    "@mercuryworkshop/bare-transport": "1.0.0",
+    "@mercuryworkshop/epoxy-tls": "2.1.19-1",
+    "@mercuryworkshop/epoxy-transport": "2.1.28",
+    "@mercuryworkshop/libcurl-transport": "1.5.2",
+    "@mercuryworkshop/scramjet": "2.0.67-alpha.2",
+    "@mercuryworkshop/scramjet-controller": "0.0.14",
+    "@mercuryworkshop/wisp-js": "^0.4.1",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@titaniumnetwork-dev/ultraviolet": "^3.2.10",
+    "adm-zip": "^0.5.16",
+    "bare-mux-legacy": "npm:@mercuryworkshop/bare-mux@1.1.4",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "electron": "^41.10.2",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.proxydevelopmenttoolkit.app",
+    "productName": "Proxy Development Toolkit",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "icon": "build/icon.png",
+    "files": [
+      "electron/**/*",
+      "src/**/*",
+      "build/icon.png",
+      "build/icon.ico",
+      "build/icon.icns",
+      "LICENSE",
+      "package.json",
+      "node_modules/**/*"
+    ],
+    "asarUnpack": [
+      "node_modules/@mercuryworkshop/**",
+      "node_modules/@titaniumnetwork-dev/**",
+      "node_modules/bare-mux-legacy/**",
+      "node_modules/@nebula-services/**",
+      "**/*.wasm",
+      "**/*.wasm.map"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.icns",
+      "target": [
+        "dir"
+      ]
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "npmRebuild": false
+  }
+}
