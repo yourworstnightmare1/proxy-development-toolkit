@@ -69,7 +69,23 @@ function cloneGit(url, dest, branch) {
 }
 
 async function copyFolder(source, dest) {
-  await fs.cp(source, dest, { recursive: true, errorOnExist: false });
+  // On Windows, recreating symlinks (common in local site trees) often fails with
+  // EPERM unless Developer Mode / elevation is enabled. Copy the real targets instead.
+  try {
+    await fs.cp(source, dest, {
+      recursive: true,
+      errorOnExist: false,
+      dereference: true,
+    });
+  } catch (error) {
+    if (error && (error.code === "EPERM" || error.code === "EACCES")) {
+      throw new Error(
+        "Could not import that folder (Windows blocked copying a shortcut/symlink inside it). "
+        + "Enable Developer Mode, or remove symlinks from the folder and try again."
+      );
+    }
+    throw error;
+  }
 }
 
 function assetHref(baseUrl, value) {
