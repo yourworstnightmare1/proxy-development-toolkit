@@ -40,7 +40,7 @@ This is the bare minimum required for you to be able to use the app, along with 
 | CPU | Intel Core i5 (2018+) | Apple M1 |
 | RAM | 4 GB DDR4 | 8-16 GB DDR4 |
 | GPU | Metal-capable | Apple M1 |
-| Disk | 1 MB | 10 GB
+| Disk | 1 GB | 10 GB
 | Network | Required unless testing local site | Required unless testing local site
 
 ### Note about Intel Mac support
