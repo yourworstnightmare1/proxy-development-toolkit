@@ -39,6 +39,9 @@
   "build": {
     "appId": "com.proxydevelopmenttoolkit.app",
     "productName": "Proxy Development Toolkit",
+    "extraMetadata": {
+      "description": "Proxy Development Toolkit"
+    },
     "directories": {
       "output": "release",
       "buildResources": "build"
