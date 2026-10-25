@@ -1,6 +1,6 @@
 "use strict";
 
-const { app, BrowserWindow, WebContentsView, dialog, ipcMain, session, shell } = require("electron");
+const { app, BrowserWindow, WebContentsView, clipboard, dialog, ipcMain, session, shell } = require("electron");
 const fs = require("fs/promises");
 const http = require("http");
 const path = require("path");
@@ -12,7 +12,13 @@ const mcpBridge = require("./mcp-bridge");
 const { buildUserAgent } = require("./user-agent");
 const buildInfo = require("./build-info");
 const attributions = require("./attributions");
+const updates = require("./updates");
+const verboseConsole = require("./verbose-console");
 const { attachDebugger } = require("./network");
+const { downloadToFile } = require("./downloads");
+const { transportPackage, isValidVersion } = require("./transports");
+const { buildFromSource } = require("./source-build");
+const devServer = require("./dev-server");
 const { installSaveAsPrompt, popupPageContextMenu } = require("./context-menu");
 const {
   newId,
@@ -46,10 +52,12 @@ let rendererOwnsInspect = false;
 let lastInspectBounds = null;
 let origin = "";
 let importsRoot = "";
-let paneLeftServer = null;
-let paneLeftPort = 0;
-let paneRightServer = null;
-let paneRightPort = 0;
+let windowChrome = null;
+let comboServers = []; // [{ server, port }]
+const comboWindows = new Map(); // comboId -> BrowserWindow
+const wantHeadless = process.argv.includes("--headless") || process.argv.includes("--mcp-startup");
+const mcpStartupLaunch = process.argv.includes("--mcp-startup");
+let headlessActive = false;
 
 function sendNetwork(event) {
   logs.pushNetwork(event);
@@ -92,15 +100,51 @@ function registerIpc() {
     await shell.openExternal(target);
     return true;
   });
+  ipcMain.handle("check-for-updates", (_event, payload) => checkForUpdates(payload));
+  ipcMain.handle("verbose-console-start", (_event, payload) => {
+    const kind = payload && payload.kind;
+    if (!kind) return { ok: false, error: "Missing console kind." };
+    return verboseConsole.startConsole(kind, {
+      title: payload.title || kind,
+      minimized: Boolean(payload.minimized),
+    });
+  });
+  ipcMain.handle("verbose-console-stop", (_event, payload) => {
+    const kind = payload && payload.kind;
+    if (!kind) return { ok: false, error: "Missing console kind." };
+    return verboseConsole.stopConsole(kind, { sigint: payload?.sigint !== false });
+  });
+  ipcMain.handle("verbose-console-stop-all", (_event, payload) => {
+    verboseConsole.stopAll({ sigint: payload?.sigint !== false });
+    return { ok: true };
+  });
+  ipcMain.handle("copy-text", (event, text) => {
+    if (!isHostSender(event)) return { ok: false };
+    clipboard.writeText(String(text ?? ""));
+    return { ok: true };
+  });
+
+  ipcMain.handle("set-window-chrome", (_event, payload) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return { ok: false };
+    windowChrome = payload && typeof payload === "object" ? payload : null;
+    applyWindowTitle();
+    return { ok: true, title: mainWindow.getTitle() };
+  });
   ipcMain.handle("list-releases", () => settingsStore.listReleases());
   ipcMain.handle("check-port", async (_event, payload) => {
     const field = payload && payload.field;
+    const devField = field === "python" || field === "node";
     const ours = (port) => {
       if (field === "wisp") return Boolean(lanWisp && lanWisp.address() && lanWisp.address().port === port);
       if (field === "mcp") return mcpServer.status().running && port === mcpServer.status().port;
-      return port === listenPort || port === extraPort || port === paneLeftPort || port === paneRightPort;
+      if (devField) return devServer.status().running && devServer.status().runtime === field && devServer.status().port === port;
+      if (comboServers.some((entry) => entry.port === port)) return true;
+      return port === listenPort || port === extraPort;
     };
     const result = await settingsStore.inspectPort(payload && payload.port, ours);
+    if (devField && result.port && (result.port === listenPort || result.port === extraPort || comboServers.some((entry) => entry.port === result.port))) {
+      return { ok: false, message: `Port ${result.port} is already in use by this app's local server.` };
+    }
     if (field === "wisp" && result.ok && result.port && (result.port === listenPort || result.port === extraPort)) {
       return { ok: false, message: `Port ${result.port} is already in use by this app's local server.` };
     }
@@ -108,13 +152,135 @@ function registerIpc() {
   });
   ipcMain.handle("download-release", async (_event, payload) => {
     const kind = payload && payload.kind === "scramjet" ? "scramjet" : "ultraviolet";
-    const result = await settingsStore.downloadRelease(kind, payload && (payload.id || payload.tag));
+    const result = await settingsStore.downloadRelease(kind, payload && (payload.id || payload.tag), downloadProgress);
     if (payload && payload.select && appSettings) {
       const key = kind === "ultraviolet" ? "uvVersion" : "scramjetVersion";
-      appSettings = await settingsStore.write({ ...appSettings, [key]: result.id || payload.id });
+      const patch = { [key]: result.id || payload.id };
+      if (kind === "scramjet" && payload.commitId) {
+        patch.scramjetContinuousCommit = String(payload.commitId);
+      }
+      appSettings = await settingsStore.write({ ...appSettings, ...patch });
       await settingsStore.applyMounts(appSettings);
     }
     return { ...result, state: runtimeState() };
+  });
+  ipcMain.handle("download-transports", async (_event, payload) => {
+    const ids = Array.isArray(payload && payload.ids) ? payload.ids.map(String) : [];
+    const versions = (payload && payload.versions && typeof payload.versions === "object") ? payload.versions : {};
+    const installed = [];
+    const failed = [];
+    for (const id of ids) {
+      const version = isValidVersion(versions[id]) ? String(versions[id]) : "latest";
+      try {
+        installed.push(await settingsStore.downloadTransport(id, version, downloadProgress, { reuse: true }));
+      } catch (error) {
+        failed.push({ id, error: error.message || String(error) });
+      }
+    }
+    if (installed.length && appSettings) {
+      const transportVersions = { ...(appSettings.transportVersions || {}) };
+      for (const entry of installed) transportVersions[entry.id] = entry.version;
+      appSettings = await settingsStore.write({ ...appSettings, transportVersions });
+      await settingsStore.applyMounts(appSettings);
+    }
+    return { ok: failed.length === 0, installed, failed, state: runtimeState() };
+  });
+  ipcMain.handle("download-app-update", async () => {
+    const result = await updates.checkForUpdate(appSettings || {}, { force: false });
+    if (!result || !result.ok) return { ok: false, error: (result && result.error) || "Could not check for updates." };
+    if (!result.updateAvailable) return { ok: false, error: "You're already on the latest version." };
+    if (result.compileFromSource) {
+      const label = result.channel === "commit" ? `commit ${result.latestVersion}` : `v${result.latestVersion}`;
+      try {
+        const build = await buildFromSource({
+          repo: updates.APP_REPO,
+          ref: result.sourceRef,
+          label,
+          workRoot: path.join(app.getPath("userData"), "source-build"),
+          headers: updates.githubHeaders(),
+          report: downloadProgress(`Compiling Proxy Development Toolkit ${label}`),
+        });
+        await shell.openPath(build.outputDir);
+        return { ok: true, compiled: true, outputDir: build.outputDir, label };
+      } catch (error) {
+        return { ok: false, error: error.message || String(error) };
+      }
+    }
+    const asset = updates.pickAppAsset(result.assets);
+    if (!asset) {
+      await shell.openExternal(result.releaseUrl);
+      return { ok: true, openedReleasePage: true };
+    }
+    const file = path.join(app.getPath("downloads"), path.basename(asset.name));
+    try {
+      await downloadToFile(asset.url, file, {
+        headers: updates.githubHeaders(),
+        onProgress: downloadProgress(`Proxy Development Toolkit v${result.latestVersion}`),
+      });
+    } catch (error) {
+      return { ok: false, error: error.message || String(error) };
+    }
+    shell.showItemInFolder(file);
+    return { ok: true, file, name: asset.name };
+  });
+  ipcMain.handle("list-transport-versions", (_event, payload) =>
+    settingsStore.listTransportVersions(appSettings || {}, { force: Boolean(payload && payload.force) }));
+  ipcMain.handle("select-transport-version", async (_event, payload) => {
+    const id = String((payload && payload.id) || "");
+    const version = String((payload && payload.version) || "bundled");
+    if (!transportPackage(id)) return { ok: false, error: `Unknown transport "${id}".` };
+    let resolved = "bundled";
+    if (version !== "bundled") {
+      try {
+        resolved = (await settingsStore.downloadTransport(id, version, downloadProgress, { reuse: true })).version;
+      } catch (error) {
+        return { ok: false, error: error.message || String(error), state: runtimeState() };
+      }
+    }
+    const transportVersions = { ...((appSettings && appSettings.transportVersions) || {}) };
+    if (resolved === "bundled") delete transportVersions[id];
+    else transportVersions[id] = resolved;
+    appSettings = await settingsStore.write({ ...(appSettings || {}), transportVersions });
+    await settingsStore.applyMounts(appSettings);
+    return { ok: true, id, version: resolved, state: runtimeState() };
+  });
+  ipcMain.handle("start-dev-server", async (_event, payload) => {
+    const send = (data) => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("dev-server-event", data);
+    };
+    const runtime = payload && payload.runtime === "node" ? "node" : "python";
+    const saved = runtime === "node" ? appSettings && appSettings.nodePort : appSettings && appSettings.pythonPort;
+    try {
+      return await devServer.start({
+        runtime,
+        folder: String((payload && payload.folder) || ""),
+        port: Number(saved) || devServer.DEFAULT_PORTS[runtime],
+        onStage: (stage) => send({ stage }),
+        onLine: (line) => send({ line }),
+      });
+    } catch (error) {
+      return { ok: false, error: error.message || String(error) };
+    }
+  });
+  ipcMain.handle("stop-dev-server", () => ({ ok: true, stopped: devServer.stop() }));
+  ipcMain.handle("detect-dev-deps", async (_event, payload) => {
+    try {
+      return await devServer.detect(String((payload && payload.folder) || ""));
+    } catch {
+      return { python: null, node: null };
+    }
+  });
+  ipcMain.handle("restart-app", () => {
+    app.relaunch();
+    app.quit();
+    return { ok: true };
+  });
+  ipcMain.handle("reset-transports", async () => {
+    if (appSettings) {
+      appSettings = await settingsStore.write({ ...appSettings, transportVersions: {} });
+      await settingsStore.applyMounts(appSettings);
+    }
+    return { ok: true, state: runtimeState() };
   });
   ipcMain.handle("save-settings", async (_event, patch) => {
     const next = settingsStore.normalize({ ...(appSettings || {}), ...(patch || {}) });
@@ -123,6 +289,8 @@ function registerIpc() {
       ["scramjetPort", (port) => port === listenPort || port === extraPort],
       ["wispPort", (port) => Boolean(lanWisp && lanWisp.address() && lanWisp.address().port === port)],
       ["mcpPort", (port) => mcpServer.status().running && port === mcpServer.status().port],
+      ["pythonPort", (port) => port === Number((appSettings || {}).pythonPort) || (devServer.status().running && devServer.status().port === port)],
+      ["nodePort", (port) => port === Number((appSettings || {}).nodePort) || (devServer.status().running && devServer.status().port === port)],
     ];
     for (const [field, ours] of fields) {
       const check = await settingsStore.inspectPort(next[field], ours);
@@ -131,8 +299,8 @@ function registerIpc() {
         return { ok: false, error: `Port ${check.port} is already in use by this app's local server.`, state: runtimeState() };
       }
     }
-    if (next.hostWispLocally && !next.wispPort) {
-      return { ok: false, error: "Choose a Wisp port before enabling local hosting.", state: runtimeState() };
+    if (next.hostWispLocally && !String(next.wispPort || "").trim()) {
+      next.wispPort = "6001";
     }
     if (next.uvVersion && !(await settingsStore.isVersionInstalled("ultraviolet", next.uvVersion))) {
       return { ok: false, error: "Download that Ultraviolet version before selecting it.", state: runtimeState() };
@@ -141,8 +309,10 @@ function registerIpc() {
       return { ok: false, error: "Download that Scramjet version before selecting it.", state: runtimeState() };
     }
     const previous = appSettings;
+    if (next.mcpLaunchOnStartup) next.mcpEnabled = true;
     appSettings = await settingsStore.write(next);
     applyRuntimePolicies(appSettings);
+    syncMcpStartupLaunch(appSettings);
     devtoolsEnabled = appSettings.devtools !== false;
     if (!devtoolsEnabled) closeInspect();
     if (wispLogging) {
@@ -188,7 +358,7 @@ function registerIpc() {
     pending(payload);
   });
 
-  function askRenderer(command, args = {}) {
+  function askRenderer(command, args = {}, timeoutMs = 30000) {
     return new Promise((resolve) => {
       if (!mainWindow || mainWindow.isDestroyed()) {
         resolve({ ok: false, error: "Window is not open." });
@@ -197,8 +367,8 @@ function registerIpc() {
       const id = newId();
       const timer = setTimeout(() => {
         mcpReplies.delete(id);
-        resolve({ ok: false, error: "Timed out waiting for the renderer." });
-      }, 30000);
+        resolve({ ok: false, error: `Timed out after ${Math.round(timeoutMs / 1000)}s waiting for the renderer to finish "${command}".` });
+      }, timeoutMs);
       mcpReplies.set(id, (payload) => {
         clearTimeout(timer);
         resolve(payload.result || payload);
@@ -215,20 +385,35 @@ function registerIpc() {
         devtools: appSettings?.devtools !== false,
         mcpEnabled: Boolean(appSettings?.mcpEnabled),
         mcpAllowControl: appSettings?.mcpAllowControl !== false,
+        mcpLaunchOnStartup: Boolean(appSettings?.mcpLaunchOnStartup),
       },
-      mcp: mcpServer.status(),
+      mcp: { ...mcpServer.status(), headless: headlessActive },
       origin,
     }),
-    startSession: async (args) => askRenderer("start_session", args),
+    startSession: async (args) => askRenderer("start_session", args, 120000),
     endSession: async () => askRenderer("end_session"),
     navigate: async (args) => askRenderer("navigate", args),
-    screenshot: async (args) => capturePane(args && args.pane),
+    focusCombo: async (args) => askRenderer("focus_combo", args),
+    getTweaks: async () => withVerboseLogFiles(await askRenderer("get_tweaks")),
+    setTweaks: async (args) => withVerboseLogFiles(await askRenderer("set_tweaks", args, 60000)),
+    screenshot: async (args) => {
+      const pane = String((args && args.pane) || "single");
+      const popped = comboWindows.get(pane);
+      if (popped && !popped.isDestroyed()) return captureWindow(popped, pane);
+      if (pane !== "single") {
+        const focused = await askRenderer("focus_combo", { comboId: pane });
+        if (focused && focused.ok === false) return focused;
+        await new Promise((resolve) => setTimeout(resolve, 400));
+      }
+      return capturePane(pane);
+    },
     getLogs: async ({ kind, limit }) => ({
       ok: true,
       kind,
       text: logs.text(kind, limit),
     }),
     openInspect: async () => {
+      if (!devtoolsEnabled) return { ok: false, error: "DevTools are disabled. Enable them in Settings → Developer." };
       openInspect();
       return { ok: true };
     },
@@ -236,7 +421,6 @@ function registerIpc() {
       closeInspect();
       return { ok: true };
     },
-    setSplitOrientation: async (args) => askRenderer("set_split_orientation", args),
   });
   ipcMain.handle("export-log", async (_event, payload) => {
     const kind = String(payload && payload.kind || "");
@@ -274,10 +458,35 @@ function registerIpc() {
 
   ipcMain.handle("get-session", () => getSession());
 
-  ipcMain.handle("ensure-split-hosts", async () => ensureExtraServer());
+  ipcMain.handle("ensure-combo-hosts", async (_event, payload) => ensureComboHosts(payload && payload.count));
+
+  ipcMain.handle("open-combo-window", async (_event, payload) => openComboWindow(payload || {}));
+  ipcMain.handle("close-combo-window", async (_event, payload) => {
+    closeComboWindow(payload && payload.comboId);
+    return { ok: true };
+  });
+  ipcMain.handle("focus-combo-window", async (_event, payload) => {
+    const win = comboWindows.get(payload && payload.comboId);
+    if (win && !win.isDestroyed()) {
+      win.show();
+      win.focus();
+      return { ok: true };
+    }
+    return { ok: false };
+  });
+  ipcMain.handle("post-combo-window", async (_event, payload) => {
+    const comboId = payload && payload.comboId;
+    const message = payload && payload.message;
+    const win = comboWindows.get(comboId);
+    if (!win || win.isDestroyed() || !message) return { ok: false };
+    await win.webContents.executeJavaScript(
+      `window.postMessage(${JSON.stringify(message)}, "*"); true;`
+    );
+    return { ok: true };
+  });
 
   ipcMain.handle("set-session", (_event, next) => {
-    if (next && next.mode === "split" && Array.isArray(next.panes)) {
+    if (next && next.mode === "multi" && Array.isArray(next.combos)) {
       setSession(next);
       return next;
     }
@@ -291,6 +500,7 @@ function registerIpc() {
   });
 
   ipcMain.handle("clear-session", () => {
+    closeAllComboWindows();
     setSession(null);
     return null;
   });
@@ -326,7 +536,7 @@ function registerIpc() {
     const dest = path.join(root, id);
     await cloneGit(url, dest, payload.branch);
     const detected = await finishImport(payload.kind, dest);
-    return { id, base: publicBase(payload.kind, id), source: url, ...detected };
+    return { id, base: publicBase(payload.kind, id), source: url, path: dest, ...detected };
   });
 
   ipcMain.on("inspect-bounds", (_event, bounds) => {
@@ -468,31 +678,181 @@ function applyRuntimePolicies(settings) {
 
 async function syncMcpServer() {
   if (!appSettings) return mcpServer.status();
+  const enabled = Boolean(appSettings.mcpEnabled)
+    || (mcpStartupLaunch && Boolean(appSettings.mcpLaunchOnStartup));
   mcpServer.configure({
     token: appSettings.mcpToken,
     control: appSettings.mcpAllowControl !== false,
   });
-  if (!appSettings.mcpEnabled) return mcpServer.stop();
-  return mcpServer.start({
-    port: appSettings.mcpPort || 7432,
-    token: appSettings.mcpToken,
-    control: appSettings.mcpAllowControl !== false,
-  });
+  try {
+    if (!enabled) return await mcpServer.stop();
+    const current = mcpServer.status();
+    if (current.running && current.port === (Number(appSettings.mcpPort) || 7432)) return current;
+    return await mcpServer.start({
+      port: appSettings.mcpPort || 7432,
+      token: appSettings.mcpToken,
+      control: appSettings.mcpAllowControl !== false,
+    });
+  } finally {
+    applyWindowTitle();
+  }
 }
 
-async function capturePane(pane) {
-  const target = pane === "left" || pane === "right" || pane === "single" ? pane : "single";
-  if (!mainWindow || mainWindow.isDestroyed()) return { ok: false, error: "Window is not open." };
-  const image = await mainWindow.webContents.capturePage();
+function syncMcpStartupLaunch(settings = appSettings) {
+  const enabled = Boolean(settings && settings.mcpLaunchOnStartup);
+  try {
+    const args = [];
+    if (!app.isPackaged) args.push(path.join(__dirname, ".."));
+    args.push("--headless", "--mcp-startup");
+    app.setLoginItemSettings({
+      openAtLogin: enabled,
+      openAsHidden: true,
+      path: process.execPath,
+      args: enabled ? args : [],
+      name: "Proxy Development Toolkit MCP",
+    });
+  } catch (error) {
+    console.error("Could not update MCP startup launch setting:", error);
+  }
+}
+
+function applyHeadlessPolicy() {
+  headlessActive = Boolean(wantHeadless);
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    mainWindow.setSkipTaskbar(headlessActive);
+  } catch { /* ignore */ }
+  if (headlessActive) {
+    if (mainWindow.isVisible()) mainWindow.hide();
+  } else if (!mainWindow.isVisible()) {
+    mainWindow.show();
+  }
+}
+
+function revealMainWindow() {
+  headlessActive = false;
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    mainWindow.setSkipTaskbar(false);
+  } catch { /* ignore */ }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+// capturePage() can throw transient compositor errors (e.g. UnknownVizError) when no fresh frame is ready.
+async function captureContents(contents, attempts = 3) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await contents.capturePage();
+    } catch (error) {
+      if (attempt >= attempts || contents.isDestroyed()) throw error;
+      try { contents.invalidate(); } catch { /* not paintable */ }
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+  }
+}
+
+async function captureWindow(win, pane) {
+  if (!win || win.isDestroyed()) return { ok: false, error: "Window is not open." };
+  let image;
+  try {
+    image = await captureContents(win.webContents);
+  } catch (error) {
+    return { ok: false, error: error.message || String(error) };
+  }
   const size = image.getSize();
   return {
     ok: true,
-    pane: target,
+    pane,
     width: size.width,
     height: size.height,
     pngBase64: image.toPNG().toString("base64"),
-    note: "Full window capture. Pane-specific cropping can be refined later.",
   };
+}
+
+async function capturePane(pane) {
+  const result = await captureWindow(mainWindow, pane || "single");
+  if (!result.ok || !inspectOpen || !inspectHosted || !inspectView) return result;
+  // capturePage() only covers the renderer; the DevTools dock is a separate child view.
+  try {
+    const dock = await captureContents(inspectView.webContents, 5);
+    const size = dock.getSize();
+    if (size.width && size.height) {
+      result.inspect = { width: size.width, height: size.height, pngBase64: dock.toPNG().toString("base64") };
+    }
+  } catch { /* dock not ready */ }
+  return result;
+}
+
+let downloadCounter = 0;
+
+function downloadProgress(label) {
+  const id = `dl-${Date.now().toString(36)}-${++downloadCounter}`;
+  return (data) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.send("download-progress", { id, label, ...data });
+  };
+}
+
+function checkForUpdates(payload) {
+  const force = Boolean(payload && payload.force);
+  const kind = payload && payload.kind;
+  if (kind === "scramjet") return updates.checkScramjetUpdate(appSettings || {}, { force });
+  if (kind === "transports") return updates.checkTransportUpdates(appSettings || {}, { force });
+  if (kind === "all") return updates.checkAllUpdates(appSettings || {}, { force });
+  return updates.checkForUpdate(appSettings || {}, { force });
+}
+
+function isHostSender(event) {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return false;
+  const frame = event.senderFrame;
+  if (!frame || frame !== mainWindow.webContents.mainFrame) return false;
+  try {
+    return new URL(frame.url).origin === new URL(origin).origin;
+  } catch {
+    return false;
+  }
+}
+
+function withVerboseLogFiles(result) {
+  if (!result || typeof result !== "object") return result;
+  return {
+    ...result,
+    logFiles: {
+      wisp: verboseConsole.logPath("wisp"),
+      proxy: verboseConsole.logPath("proxy"),
+      transport: verboseConsole.logPath("transport"),
+    },
+  };
+}
+
+const APP_TITLE = "Proxy Development Toolkit";
+
+function plural(count, word, many = `${word}s`) {
+  return `${count} ${count === 1 ? word : many}`;
+}
+
+function composeWindowTitle(chrome) {
+  const mcp = mcpServer.status().running;
+  if (chrome && chrome.cloakTitle) return String(chrome.cloakTitle);
+  if (!chrome || !chrome.session) return mcp ? `${APP_TITLE} | MCP` : APP_TITLE;
+  const parts = [chrome.siteTitle || "New Tab", APP_TITLE];
+  if (chrome.proxy) parts.push(chrome.proxy);
+  if (chrome.transport) parts.push(chrome.transport);
+  if (mcp) parts.push("MCP");
+  parts.push([
+    plural(Number(chrome.tabs) || 0, "Tab"),
+    plural(Number(chrome.proxies) || 0, "proxy", "proxies"),
+    plural(Number(chrome.transports) || 0, "transport"),
+    `Wisp ${chrome.wisp ? "active" : "inactive"}`,
+  ].join(", "));
+  return parts.join(" | ");
+}
+
+function applyWindowTitle() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try { mainWindow.setTitle(composeWindowTitle(windowChrome)); } catch { /* ignore */ }
 }
 
 function runtimeState() {
@@ -506,9 +866,8 @@ function runtimeState() {
     portNotice,
     wisp: settingsStore.wispDisplay(hosting, port),
     devtools: devtoolsEnabled,
-    mcp: mcpServer.status(),
-    about: buildInfo.collect(),
-  };
+    mcp: { ...mcpServer.status(), headless: headlessActive, startupLaunch: Boolean(appSettings?.mcpLaunchOnStartup) },
+    about: buildInfo.collect(),  };
 }
 
 function portsNeedRestart() {
@@ -538,16 +897,12 @@ function listenOn(server, port, host) {
 function attachWispUpgrade(server) {
   if (!server || !wispServer) return;
   server.on("upgrade", (req, socket, head) => {
-    const target = req.url || "";
-    if (target === "/wisp/" || target.startsWith("/wisp/?")) {
-      wispServer.routeRequest(req, socket, head);
-      return;
-    }
-    socket.destroy();
+    routeWispUpgrade(wispServer, req, socket, head);
   });
 }
 
-async function ensureExtraServer() {
+async function ensureComboHosts(count = 1) {
+  const need = Math.max(0, Number(count) || 0);
   async function startPaneServer() {
     const server = createStaticServer(importsRoot);
     attachWispUpgrade(server);
@@ -555,27 +910,76 @@ async function ensureExtraServer() {
     return { server, port: server.address().port };
   }
 
-  if (!paneLeftServer || !paneLeftPort) {
-    if (extraServer && extraPort && extraPort !== listenPort) {
-      paneLeftServer = extraServer;
-      paneLeftPort = extraPort;
-    } else {
-      const started = await startPaneServer();
-      paneLeftServer = started.server;
-      paneLeftPort = started.port;
+  while (comboServers.length < need) {
+    if (comboServers.length === 0 && extraServer && extraPort && extraPort !== listenPort) {
+      comboServers.push({ server: extraServer, port: extraPort });
+      continue;
     }
+    comboServers.push(await startPaneServer());
   }
-  if (!paneRightServer || !paneRightPort || paneRightPort === paneLeftPort) {
-    const started = await startPaneServer();
-    paneRightServer = started.server;
-    paneRightPort = started.port;
-  }
+
   return {
-    leftPort: paneLeftPort,
-    rightPort: paneRightPort,
-    leftOrigin: `http://127.0.0.1:${paneLeftPort}`,
-    rightOrigin: `http://127.0.0.1:${paneRightPort}`,
+    hosts: comboServers.slice(0, need).map((entry) => ({
+      port: entry.port,
+      origin: `http://127.0.0.1:${entry.port}`,
+    })),
   };
+}
+
+async function openComboWindow(payload) {
+  const comboId = String(payload.comboId || "").trim();
+  const originUrl = String(payload.origin || "").trim();
+  const session = payload.session;
+  if (!comboId || !originUrl || !session) {
+    return { ok: false, error: "Missing combo window payload." };
+  }
+  closeComboWindow(comboId);
+  const win = new BrowserWindow({
+    width: 1100,
+    height: 760,
+    minWidth: 640,
+    minHeight: 480,
+    backgroundColor: "#161616",
+    title: payload.title || `PDTK · ${comboId}`,
+    show: true,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+  comboWindows.set(comboId, win);
+  win.on("closed", () => {
+    comboWindows.delete(comboId);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("combo-window-closed", { comboId });
+    }
+  });
+  await win.loadURL(`${originUrl.replace(/\/$/, "")}/harness/pane.html`);
+  const boot = {
+    type: "pdtk-boot",
+    session,
+  };
+  await win.webContents.executeJavaScript(
+    `window.__pdtkBootPane && window.__pdtkBootPane(${JSON.stringify(session)}); true;`
+  ).catch(async () => {
+    await win.webContents.executeJavaScript(
+      `window.postMessage(${JSON.stringify(boot)}, "*"); true;`
+    );
+  });
+  return { ok: true, comboId };
+}
+
+function closeComboWindow(comboId) {
+  const id = String(comboId || "").trim();
+  const win = comboWindows.get(id);
+  if (!win) return;
+  comboWindows.delete(id);
+  if (!win.isDestroyed()) win.destroy();
+}
+
+function closeAllComboWindows() {
+  for (const id of [...comboWindows.keys()]) closeComboWindow(id);
 }
 
 function contentSize() {
@@ -651,6 +1055,76 @@ function applyInspectBounds(bounds) {
 let fitInspectTimer = null;
 let fitInspectCssKey = null;
 
+const INSPECT_FILL_CSS = `
+:root, html, body {
+  --devtools-window-left: 0px !important;
+  --devtools-window-top: 0px !important;
+  --devtools-window-right: 0px !important;
+  --devtools-window-bottom: 0px !important;
+}
+html, body, .root-view, .root-view > .split-widget {
+  width: 100% !important;
+  height: 100% !important;
+  max-width: none !important;
+  max-height: none !important;
+  margin: 0 !important;
+  left: 0 !important;
+  top: 0 !important;
+}
+.inspected-page-placeholder {
+  display: none !important;
+}
+.root-view > .split-widget:has(.inspected-page-placeholder) > [slot="main"] {
+  display: none !important;
+  width: 0 !important;
+  min-width: 0 !important;
+  flex: 0 0 0px !important;
+}
+.root-view > .split-widget:has(.inspected-page-placeholder) > [slot="sidebar"] {
+  position: absolute !important;
+  inset: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  max-width: none !important;
+  left: 0 !important;
+  margin: 0 !important;
+}
+.root-view > .split-widget:has(.inspected-page-placeholder) > .split-widget-resizer {
+  display: none !important;
+}
+`;
+
+const INSPECT_FILL_JS = `(() => {
+  const apply = () => {
+    const placeholder = document.querySelector(".inspected-page-placeholder");
+    if (!placeholder) return;
+    const main = placeholder.closest("[slot='main']");
+    if (main) {
+      main.style.setProperty("display", "none", "important");
+      main.style.setProperty("width", "0px", "important");
+      main.style.setProperty("min-width", "0px", "important");
+    }
+    const split = placeholder.closest(".split-widget");
+    const sidebar = split && split.querySelector(':scope > [slot="sidebar"]');
+    if (sidebar) {
+      sidebar.style.setProperty("position", "absolute", "important");
+      sidebar.style.setProperty("inset", "0px", "important");
+      sidebar.style.setProperty("width", "100%", "important");
+      sidebar.style.setProperty("height", "100%", "important");
+      sidebar.style.setProperty("max-width", "none", "important");
+      sidebar.style.setProperty("left", "0px", "important");
+      sidebar.style.removeProperty("transform");
+    }
+    const resizer = split && split.querySelector(":scope > .split-widget-resizer");
+    if (resizer) resizer.style.setProperty("display", "none", "important");
+  };
+  apply();
+  if (!window.__pdtkFillInspect) {
+    window.__pdtkFillInspect = true;
+    window.addEventListener("resize", apply);
+  }
+})()`;
+
 async function fitInspectContents() {
   const contents = inspectView && inspectView.webContents;
   if (!contents || contents.isDestroyed()) return;
@@ -663,73 +1137,19 @@ async function fitInspectContents() {
 async function paintInspectContents() {
   const contents = inspectView && inspectView.webContents;
   if (!contents || contents.isDestroyed() || !inspectView) return;
-  const bounds = inspectView.getBounds();
-  const width = Math.max(40, Math.round(bounds.width));
-  const height = Math.max(40, Math.round(bounds.height));
-  inspectView.setBounds({ x: bounds.x, y: bounds.y, width: Math.max(40, width - 1), height: Math.max(40, height - 1) });
-  inspectView.setBounds({ x: bounds.x, y: bounds.y, width, height });
+  const url = String(contents.getURL() || "");
+  if (url && !url.startsWith("devtools:")) return;
 
   try {
-    if (!contents.debugger.isAttached()) contents.debugger.attach("1.3");
-    await contents.debugger.sendCommand("Emulation.clearDeviceMetricsOverride");
-    await contents.debugger.sendCommand("Emulation.setDeviceMetricsOverride", {
-      width,
-      height,
-      deviceScaleFactor: 1,
-      mobile: false,
-      scale: 1,
-    });
+    if (!fitInspectCssKey) fitInspectCssKey = await contents.insertCSS(INSPECT_FILL_CSS);
   } catch {
-    /* DevTools frontend may reject emulation; CSS fallback below still runs. */
-  }
-
-  const css = `
-html, body {
-  width: ${width}px !important;
-  height: ${height}px !important;
-  min-width: ${width}px !important;
-  min-height: ${height}px !important;
-  margin: 0 !important;
-  overflow: hidden !important;
-  position: relative !important;
-}
-body > .root-view,
-body > .vbox,
-.root-view {
-  position: absolute !important;
-  left: 0 !important;
-  top: 0 !important;
-  right: 0 !important;
-  bottom: 0 !important;
-  width: ${width}px !important;
-  height: ${height}px !important;
-  max-width: none !important;
-  max-height: none !important;
-}
-`;
-  try {
-    if (fitInspectCssKey) {
-      await contents.removeInsertedCSS(fitInspectCssKey);
-      fitInspectCssKey = null;
-    }
-    fitInspectCssKey = await contents.insertCSS(css);
-  } catch {
-    /* ignore */
+    fitInspectCssKey = null;
   }
 
   try {
-    await contents.executeJavaScript(`(() => {
-      const w = ${width};
-      const h = ${height};
-      for (const el of [document.documentElement, document.body, ...document.querySelectorAll(".root-view")]) {
-        if (!el) continue;
-        el.style.setProperty("width", w + "px", "important");
-        el.style.setProperty("height", h + "px", "important");
-      }
-      window.dispatchEvent(new Event("resize"));
-    })()`, true);
+    await contents.executeJavaScript(INSPECT_FILL_JS, true);
   } catch {
-    /* ignore */
+    /* DevTools frontend may not be ready yet. */
   }
 }
 
@@ -755,7 +1175,7 @@ function openInspect() {
   inspectOpen = true;
   layoutInspect();
   if (inspectHosted && mainWindow && !mainWindow.webContents.isDevToolsOpened()) {
-    mainWindow.webContents.openDevTools({ activate: true });
+    mainWindow.webContents.openDevTools({ mode: "detach", activate: true });
   } else if (!inspectHosted && mainWindow) {
     mainWindow.webContents.openDevTools({ mode: "right", activate: true });
   }
@@ -858,8 +1278,12 @@ async function createWindow() {
   await fs.mkdir(path.join(importsRoot, "sites"), { recursive: true });
   await fs.mkdir(path.join(importsRoot, "imports", "proxies"), { recursive: true });
   appSettings = await settingsStore.init(importsRoot);
+  if (mcpStartupLaunch && appSettings.mcpLaunchOnStartup && !appSettings.mcpEnabled) {
+    appSettings = await settingsStore.write({ ...appSettings, mcpEnabled: true });
+  }
   devtoolsEnabled = appSettings.devtools !== false;
   applyRuntimePolicies(appSettings);
+  syncMcpStartupLaunch(appSettings);
   await settingsStore.applyMounts(appSettings);
   const plan = settingsStore.listenPlan(appSettings);
 
@@ -881,12 +1305,7 @@ async function createWindow() {
   });
 
   httpServer.on("upgrade", (req, socket, head) => {
-    const target = req.url || "";
-    if (target === "/wisp/" || target.startsWith("/wisp/?")) {
-      wisp.routeRequest(req, socket, head);
-      return;
-    }
-    socket.destroy();
+    routeWispUpgrade(wisp, req, socket, head);
   });
 
   try {
@@ -946,11 +1365,14 @@ async function createWindow() {
     }
   }
 
+  headlessActive = Boolean(wantHeadless);
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 840,
     minWidth: 960,
     minHeight: 640,
+    show: !headlessActive,
+    skipTaskbar: headlessActive,
     backgroundColor: "#161616",
     title: "Proxy Development Toolkit",
     autoHideMenuBar: true,
@@ -963,6 +1385,16 @@ async function createWindow() {
       devTools: true,
     },
   });
+  mainWindow.on("page-title-updated", (event) => {
+    event.preventDefault();
+    applyWindowTitle();
+  });
+  if (!headlessActive) {
+    mainWindow.once("ready-to-show", () => {
+      if (!mainWindow || mainWindow.isDestroyed() || headlessActive) return;
+      mainWindow.show();
+    });
+  }
 
   inspectView = new WebContentsView({
     webPreferences: {
@@ -1025,7 +1457,12 @@ async function createWindow() {
 
   logs.captureContents(mainWindow.webContents);
   if (inspectView) {
-    inspectView.webContents.on("did-finish-load", () => fitInspectContents());
+    inspectView.webContents.on("did-finish-load", () => {
+      fitInspectCssKey = null;
+      fitInspectContents();
+      setTimeout(() => fitInspectContents(), 200);
+      setTimeout(() => fitInspectContents(), 800);
+    });
     logs.captureContents(inspectView.webContents);
   }
   mainWindow.webContents.setWindowOpenHandler(() => {
@@ -1052,17 +1489,15 @@ async function createWindow() {
   }
   mainWindow.on("closed", () => {
     mainWindow = null;
-    void mcpServer.stop();
-    httpServer.close();
+    closeAllComboWindows();
+    void mcpServer.stop();    httpServer.close();
     if (extraServer) extraServer.close();
-    if (paneLeftServer && paneLeftServer !== extraServer) paneLeftServer.close();
-    if (paneRightServer && paneRightServer !== extraServer && paneRightServer !== paneLeftServer) {
-      paneRightServer.close();
+    for (const entry of comboServers) {
+      if (entry.server && entry.server !== extraServer && entry.server !== httpServer) {
+        try { entry.server.close(); } catch { /* ignore */ }
+      }
     }
-    paneLeftServer = null;
-    paneRightServer = null;
-    paneLeftPort = 0;
-    paneRightPort = 0;
+    comboServers = [];
     if (lanWisp) lanWisp.close();
   });
 }
@@ -1072,11 +1507,29 @@ if (process.platform === "win32") {
   app.setAppUserModelId("com.proxydevelopmenttoolkit.app");
 }
 
-app.whenReady().then(async () => {
-  registerIpc();
-  await createWindow();
-});
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", (_event, argv) => {
+    const requestVisible = !argv.includes("--headless") && !argv.includes("--mcp-startup");
+    if (requestVisible) revealMainWindow();
+    else if (mainWindow && !mainWindow.isDestroyed()) mainWindow.focus();
+  });
+
+  app.whenReady().then(async () => {
+    registerIpc();
+    await createWindow();
+    applyHeadlessPolicy();
+  });
+}
 
 app.on("window-all-closed", () => {
+  try { verboseConsole.stopAll({ sigint: true }); } catch { /* ignore */ }
   app.quit();
+});
+
+app.on("before-quit", () => {
+  try { verboseConsole.stopAll({ sigint: true }); } catch { /* ignore */ }
+  try { devServer.stop(); } catch { /* ignore */ }
 });

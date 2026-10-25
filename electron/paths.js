@@ -43,6 +43,7 @@ function vendorMounts() {
     "/baremux-legacy/": modulePath("bare-mux-legacy", "dist"),
     "/vendor/epoxy-tls/": modulePath("@mercuryworkshop", "epoxy-tls", "full"),
     "/vendor/wisp/": modulePath("@mercuryworkshop", "wisp-js", "dist"),
+    "/vendor/eruda/": modulePath("eruda"),
   };
   for (const [prefix, root] of vendorOverrides) mounts[prefix] = root;
   return mounts;

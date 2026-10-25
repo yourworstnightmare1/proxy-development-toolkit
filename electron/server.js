@@ -30,18 +30,20 @@ function setSession(session) {
     sessionsByPort.clear();
     return;
   }
-  if (session.mode === "split" && Array.isArray(session.panes)) {
+  if ((session.mode === "multi" || session.mode === "split") && Array.isArray(session.combos || session.panes)) {
+    const items = session.mode === "multi" ? session.combos : session.panes;
     sessionsByPort.clear();
-    for (const pane of session.panes) {
-      if (!pane || !Number.isFinite(pane.port)) continue;
-      sessionsByPort.set(pane.port, {
+    for (const item of items) {
+      if (!item || !Number.isFinite(item.port)) continue;
+      sessionsByPort.set(item.port, {
         destination: session.destination,
         localSite: session.localSite,
-        transport: session.transport,
+        transport: item.transport || session.transport,
         wispUrl: session.wispUrl,
         bareUrl: session.bareUrl,
-        proxy: pane.proxy,
-        pane: pane.id,
+        proxy: item.proxy,
+        pane: item.id,
+        comboId: item.id,
       });
     }
     return;
@@ -116,6 +118,59 @@ addEventListener("fetch", (event) => {
 `;
 }
 
+// Stock Ultraviolet 3.2.10's BareClient turns Headers into a plain object.
+// epoxy-tls and libcurl iterate that value with for...of, which throws
+// "headers is not iterable". Pass a sequence of pairs instead.
+const UV_BARE_CLIENT_PATCH = `if (self.Ultraviolet && Ultraviolet.BareClient && !Ultraviolet.BareClient.__pdtkHeaders) {
+  Ultraviolet.BareClient.__pdtkHeaders = true;
+  const orig = Ultraviolet.BareClient.prototype.fetch;
+  const toTuples = (headers) => {
+    const rows = [];
+    if (headers == null) return rows;
+    if (Array.isArray(headers)) {
+      for (const row of headers) {
+        if (!Array.isArray(row) || row.length < 2) continue;
+        if (Array.isArray(row[1])) for (const item of row[1]) rows.push([String(row[0]), String(item)]);
+        else rows.push([String(row[0]), String(row[1])]);
+      }
+      return rows;
+    }
+    if (typeof headers.forEach === "function") {
+      headers.forEach((value, key) => {
+        if (Array.isArray(value)) for (const item of value) rows.push([String(key), String(item)]);
+        else rows.push([String(key), String(value)]);
+      });
+      return rows;
+    }
+    for (const key of Object.keys(headers)) {
+      const value = headers[key];
+      if (Array.isArray(value)) for (const item of value) rows.push([String(key), String(item)]);
+      else rows.push([String(key), String(value)]);
+    }
+    return rows;
+  };
+  const toRecord = (headers) => {
+    const out = {};
+    for (const [key, value] of toTuples(headers)) {
+      const k = String(key).toLowerCase();
+      if (k in out) out[k] = [].concat(out[k], String(value));
+      else out[k] = String(value);
+    }
+    delete out["content-encoding"];
+    delete out["content-length"];
+    return out;
+  };
+  Ultraviolet.BareClient.prototype.fetch = function(url, opts) {
+    opts = Object.assign({}, opts || {});
+    opts.headers = toTuples(opts.headers);
+    return orig.call(this, url, opts).then((res) => {
+      res.rawHeaders = toRecord(res.rawHeaders || res.headers);
+      return res;
+    });
+  };
+}
+`;
+
 function ultravioletWorker(session) {
   const base = session?.proxy?.base ? `/${session.proxy.base}` : "/uv";
   const bundle = session?.proxy?.bundle ? `${base}/${session.proxy.bundle}` : "/uv/uv.bundle.js";
@@ -133,7 +188,7 @@ self.__uv$config = {
   config: "/uv/uv.config.js",
   sw: ${JSON.stringify(sw)},
 };
-importScripts(${JSON.stringify(sw)});
+${UV_BARE_CLIENT_PATCH}importScripts(${JSON.stringify(sw)});
 const uv = new UVServiceWorker();
 self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
@@ -146,9 +201,8 @@ self.addEventListener("fetch", (event) => {
 `;
 }
 
-function workerSource(port) {
-  const activeSession = getPortSession(port);
-  if (!activeSession) {
+function workerSource(activeSession) {
+  if (!activeSession || !activeSession.proxy) {
     return `self.addEventListener("fetch", () => {});\n`;
   }
   if (activeSession.proxy.kind === "ultraviolet") return ultravioletWorker(activeSession);
@@ -193,7 +247,7 @@ function createStaticServer(importsRoot) {
   const server = http.createServer((req, res) => {
     try {
       const port = boundPort || (server.address() && server.address().port) || 0;
-      handle(req, res, vendorMounts(), importsRoot, port);
+      handle(req, res, vendorMounts(), importsRoot, getPortSession(port));
     } catch (error) {
       sendText(res, 500, error.stack || String(error));
     }
@@ -205,16 +259,15 @@ function createStaticServer(importsRoot) {
   return server;
 }
 
-function handle(req, res, mounts, importsRoot, port) {
+function handle(req, res, mounts, importsRoot, session) {
   const url = new URL(req.url || "/", "http://127.0.0.1");
   const pathname = url.pathname;
 
   if (pathname === "/sw.js") {
-    sendText(res, 200, workerSource(port), "text/javascript; charset=utf-8");
+    sendText(res, 200, workerSource(session), "text/javascript; charset=utf-8");
     return;
   }
   if (pathname === "/uv/uv.config.js") {
-    const session = getPortSession(port);
     const base = session?.proxy?.base ? `/${session.proxy.base}` : "/uv";
     const bundle = session?.proxy?.bundle ? `${base}/${session.proxy.bundle}` : "/uv/uv.bundle.js";
     const handler = session?.proxy?.handler ? `${base}/${session.proxy.handler}` : "/uv/uv.handler.js";
@@ -318,6 +371,8 @@ function handle(req, res, mounts, importsRoot, port) {
 
 module.exports = {
   createStaticServer,
+  handleStatic: handle,
+  sendText,
   setSession,
   getSession,
   setPortSession,

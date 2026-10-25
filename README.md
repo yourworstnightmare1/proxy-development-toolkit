@@ -11,15 +11,27 @@ Welcome to the Proxy Development Toolkit! Are you developing your site around us
 - [bare-mux](https://github.com/mercuryworkshop/bare-mux)
 - Full WSS/Wisp support with local and public Wisp servers
 - Ability to test any site via URL (public site) or locally
-- Ability to test both Ultraviolet and Scramjet at the same time
+- Ability to test Ultraviolet and Scramjet (and multiple transport combos) at the same time via Test Combos — each combo opens as a tab, and can pop out to its own window
 - Switch proxies/transport methods at any time while testing a site
 - Electron DevTools support (based on Chromium DevTools)
-- User agent/screen resolution spofing
+- Optional Eruda console injected into proxied pages (lightweight, mobile-friendly; no MCP support)
+- Update checks for Scramjet and the transports (epoxy, libcurl, wisp-js, bare, bare-mux), with one-click download from npm and a switch back to the bundled versions
+- User agent/screen resolution spoofing
 - Ability to export network/DevTools/performance/system/application log info to custom location
 - Full MCP support to allow AI agents such as Cursor/Claude/Codex and others to directly interact with the browser environment and test your site using the proxies and transport methods you ask the AI to use
 
 # Screenshots
-[wip]
+Home screen — pick a site, proxy, and transport, then start a session.
+
+![Home screen](docs/screenshots/home.png)
+
+A proxied session with Inspect open (Chromium DevTools).
+
+![Inspect dock](docs/screenshots/inspect.png)
+
+Info panel with session details and live network logs.
+
+![Info panel](docs/screenshots/info.png)
 
 # System Requirements
 This is the bare minimum required for you to be able to use the app, along with what I recommend to have the smoothest experience.
@@ -30,7 +42,7 @@ This is the bare minimum required for you to be able to use the app, along with 
 | CPU | Intel Core i3-6100+/AMD A8-7600 | Intel i5-10400+/AMD Ryzen 5 3600 |
 | RAM | 4 GB DDR4 | 8-16 GB DDR4 |
 | GPU | Intel HD Graphics 530 | Intel UHD 730 |
-| Disk | 1 MB | 10 GB
+| Disk | 1 GB | 10 GB
 | Network | Required unless testing local site | Required unless testing local site
 
 ## Minimum/Recommended - macOS

@@ -73,6 +73,12 @@ function push(kind, line) {
   list.push(stamped);
   if (list.length > LIMIT) list.splice(0, list.length - LIMIT);
   appendFile(kind, stamped);
+  try {
+    const verbose = require("./verbose-console");
+    if (kind === "wisp") verbose.writeConsole("wisp", stamped);
+    if (kind === "proxy" || kind === "browser") verbose.writeConsole("proxy", stamped);
+    if (kind === "network" || kind === "application") verbose.writeConsole("transport", stamped);
+  } catch { /* ignore */ }
 }
 
 function text(kind, limit) {

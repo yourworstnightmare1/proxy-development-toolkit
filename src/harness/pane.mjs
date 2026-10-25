@@ -1,3 +1,5 @@
+import { syncEruda } from "./eruda.mjs";
+
 const BARE_TRANSPORTS = new Set(["bare-transport", "bare-mux"]);
 const frame = document.getElementById("view");
 
@@ -7,7 +9,12 @@ const paneState = {
   frameHandle: null,
   connection: null,
   parentOrigin: "*",
+  eruda: false,
 };
+
+frame.addEventListener("load", () => {
+  if (paneState.eruda) syncEruda(frame.contentWindow, true);
+});
 
 function joinBase(base, file) {
   return `/${String(base).replace(/^\/+|\/+$/g, "")}/${String(file).replace(/^\/+/, "")}`;
@@ -71,9 +78,10 @@ function wrapTransport(transport) {
       if (body instanceof Blob) body = await body.arrayBuffer();
       const started = performance.now();
       try {
+        const headerList = asTuples(headers);
         const response = transport.client?.fetch
-          ? await transport.client.fetch(remote.href, { method, body, headers, redirect: "manual", signal })
-          : await transport.request(remote, method, body, asTuples(headers), signal);
+          ? await transport.client.fetch(remote.href, { method, body, headers: headerList, redirect: "manual", signal })
+          : await transport.request(remote, method, body, headerList, signal);
         postParent({
           type: "pdtk-stat",
           detail: {
@@ -128,7 +136,7 @@ async function createRawTransport(session) {
     return client;
   }
   if (session.transport === "libcurl-transport") {
-    const mod = await withoutProcess(() => import("/libcurl/index.mjs"));
+    const mod = await withoutProcess(() => import("/harness/libcurl-transport.mjs"));
     const client = new mod.default({ wisp: session.wispUrl });
     await client.init();
     return client;
@@ -148,24 +156,51 @@ async function createRawTransport(session) {
   return client;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+function waitForActivation(worker) {
+  if (!worker || worker.state === "activated" || worker.state === "redundant") return Promise.resolve();
+  return new Promise((resolve) => {
+    const onChange = () => {
+      if (worker.state !== "activated" && worker.state !== "redundant") return;
+      worker.removeEventListener("statechange", onChange);
+      resolve();
+    };
+    worker.addEventListener("statechange", onChange);
+  });
+}
+
+// A retired worker from the previous session can still be `controller`; only the
+// registration's current active worker has this session's transport attached.
+async function workerControlsPage(registration, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const pending = registration.installing || registration.waiting;
+    if (pending) {
+      await Promise.race([waitForActivation(pending), sleep(deadline - Date.now())]);
+      continue;
+    }
+    if (registration.active && navigator.serviceWorker.controller === registration.active) return true;
+    await Promise.race([
+      new Promise((resolve) => navigator.serviceWorker.addEventListener("controllerchange", resolve, { once: true })),
+      sleep(Math.min(250, deadline - Date.now())),
+    ]);
+  }
+  return false;
+}
+
 async function registerWorker() {
   if (!navigator.serviceWorker) throw new Error("Service workers are not available.");
-  const registrations = await navigator.serviceWorker.getRegistrations();
-  await Promise.all(registrations.map((registration) => registration.unregister()));
-  const registration = await navigator.serviceWorker.register("/sw.js", {
-    scope: "/",
-    updateViaCache: "none",
-  });
+  const options = { scope: "/", updateViaCache: "none" };
+  let registration = await navigator.serviceWorker.register("/sw.js", options);
   await registration.update().catch(() => {});
-  await navigator.serviceWorker.ready;
-  if (navigator.serviceWorker.controller) return;
-  await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("Timed out waiting for the service worker")), 8000);
-    navigator.serviceWorker.addEventListener("controllerchange", () => {
-      clearTimeout(timer);
-      resolve();
-    }, { once: true });
-  });
+  if (await workerControlsPage(registration, 4000)) return;
+  await registration.unregister().catch(() => {});
+  registration = await navigator.serviceWorker.register("/sw.js", options);
+  if (await workerControlsPage(registration, 8000)) return;
+  throw new Error("Timed out waiting for the service worker");
 }
 
 async function bootScramjet(session) {
@@ -233,7 +268,7 @@ async function bootUltraviolet(session) {
   } else if (session.transport === "wisp-js") {
     await paneState.connection.setTransport("/harness/wisp-js-transport.mjs", [{ wisp: session.wispUrl }]);
   } else if (session.transport === "libcurl-transport") {
-    await paneState.connection.setTransport("/libcurl/index.mjs", [{ wisp: session.wispUrl }]);
+    await paneState.connection.setTransport("/harness/libcurl-transport.mjs", [{ wisp: session.wispUrl }]);
   } else {
     await paneState.connection.setTransport("/epoxy/index.mjs", [{ wisp: session.wispUrl }]);
   }
@@ -280,10 +315,11 @@ async function boot(session) {
   paneState.connection = null;
   frame.src = "about:blank";
   if (session.screen) applyScreenSpoof(session.screen);
+  paneState.eruda = Boolean(session.eruda);
   if (session.proxy.kind === "scramjet") await bootScramjet(session);
   else if (session.proxy.kind === "ultraviolet") await bootUltraviolet(session);
   if (session.destination) navigate(session.destination);
-  postParent({ type: "pdtk-ready", pane: session.pane });
+  postParent({ type: "pdtk-ready", pane: session.pane, comboId: session.comboId || session.pane });
 }
 
 function applyTransport(session) {
@@ -309,12 +345,17 @@ window.addEventListener("message", (event) => {
   if (data.type === "pdtk-boot") {
     paneState.parentOrigin = event.origin || "*";
     boot(data.session).catch((error) => {
-      postParent({ type: "pdtk-error", pane: data.session?.pane, error: error.message || String(error) });
+      postParent({ type: "pdtk-error", pane: data.session?.pane || data.session?.comboId, error: error.message || String(error) });
     });
     return;
   }
   if (data.type === "pdtk-screen") {
     applyScreenSpoof(data.screen);
+    return;
+  }
+  if (data.type === "pdtk-eruda") {
+    paneState.eruda = Boolean(data.enabled);
+    syncEruda(frame.contentWindow, paneState.eruda);
     return;
   }
   if (data.type === "pdtk-navigate" && paneState.session) {
@@ -338,9 +379,33 @@ window.addEventListener("message", (event) => {
   }
   if (data.type === "pdtk-apply" && paneState.session) {
     applyTransport(data.session).catch((error) => {
-      postParent({ type: "pdtk-error", pane: paneState.session?.pane, error: error.message || String(error) });
+      postParent({ type: "pdtk-error", pane: paneState.session?.pane || paneState.session?.comboId, error: error.message || String(error) });
     });
   }
 });
+
+window.__pdtkBootPane = (session) => {
+  paneState.parentOrigin = "*";
+  return boot(session);
+};
+
+let lastTitle = null;
+setInterval(() => {
+  if (!paneState.session) return;
+  let title = "";
+  try { title = frame.contentDocument?.title || ""; } catch { /* cross-origin document */ }
+  if (title === lastTitle) return;
+  lastTitle = title;
+  if (parent === window) {
+    if (title) document.title = `${title} | Proxy Development Toolkit`;
+    return;
+  }
+  postParent({
+    type: "pdtk-title",
+    pane: paneState.session.pane,
+    comboId: paneState.session.comboId || paneState.session.pane,
+    title,
+  });
+}, 1000);
 
 postParent({ type: "pdtk-pane-hello" });

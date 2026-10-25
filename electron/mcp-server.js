@@ -13,6 +13,8 @@ let currentToken = "";
 let allowControl = true;
 const sessions = new Map();
 
+const TRANSPORT_HINT = "Transport ids: epoxy-tls, wisp-js, libcurl-transport, bare-transport, bare-mux (aliases epoxy, libcurl, wisp, bare are accepted).";
+
 function textResult(payload) {
   return {
     content: [{ type: "text", text: typeof payload === "string" ? payload : JSON.stringify(payload, null, 2) }],
@@ -26,13 +28,13 @@ function controlDenied() {
 function createMcp() {
   const mcp = new McpServer({
     name: "proxy-development-toolkit",
-    version: "1.0.0",
+    version: require("../package.json").version,
   }, {
     instructions: "Control and observe the Proxy Development Toolkit: Scramjet/Ultraviolet sessions, screenshots, console and network logs.",
   });
 
   mcp.registerTool("get_status", {
-    description: "Get the current session, proxy, split, and toolkit status.",
+    description: "Get the current session, proxy/transport combos, and toolkit status.",
     inputSchema: {},
   }, async () => textResult(await handlers.getStatus()));
 
@@ -57,31 +59,42 @@ function createMcp() {
   }, async ({ limit }) => textResult(await handlers.getLogs({ kind: "wisp", limit })));
 
   mcp.registerTool("screenshot", {
-    description: "Capture a PNG screenshot of a proxy pane (single, left, or right).",
+    description: "Capture a PNG screenshot of the toolkit window. In a combos session, pass a combo id (see get_status → session.combos) to focus that combo first, or capture its popped-out window. When the Inspect dock is open, its DevTools panel is returned as a second image.",
     inputSchema: {
-      pane: z.enum(["single", "left", "right"]).optional(),
+      pane: z.string().optional().describe("\"single\" (default) or a combo id."),
     },
   }, async ({ pane }) => {
     const result = await handlers.screenshot({ pane: pane || "single" });
     if (!result.ok) return textResult(result);
-    return {
-      content: [
-        { type: "text", text: JSON.stringify({ ok: true, pane: result.pane, width: result.width, height: result.height }) },
-        { type: "image", data: result.pngBase64, mimeType: "image/png" },
-      ],
-    };
+    const content = [
+      {
+        type: "text",
+        text: JSON.stringify({
+          ok: true,
+          pane: result.pane,
+          width: result.width,
+          height: result.height,
+          inspect: result.inspect ? { width: result.inspect.width, height: result.inspect.height } : undefined,        }),
+      },
+      { type: "image", data: result.pngBase64, mimeType: "image/png" },
+    ];
+    if (result.inspect) content.push({ type: "image", data: result.inspect.pngBase64, mimeType: "image/png" });
+    return { content };
   });
 
   mcp.registerTool("start_session", {
-    description: "Start a proxy session. Requires control tools.",
+    description: `Start a proxy session. Pass combos[] for multi proxy/transport tabs, or proxy+transport for a single session. ${TRANSPORT_HINT} Returns once every combo has started or failed; failed combos are listed in the result. Requires control tools.`,
     inputSchema: {
       url: z.string().min(1),
       proxy: z.enum(["scramjet", "ultraviolet"]).optional(),
-      leftProxy: z.enum(["scramjet", "ultraviolet"]).optional(),
-      rightProxy: z.enum(["scramjet", "ultraviolet"]).optional(),
-      transport: z.string().optional(),
-      split: z.boolean().optional(),
-      orientation: z.enum(["horizontal", "vertical"]).optional(),
+      transport: z.string().optional().describe(TRANSPORT_HINT),
+      combos: z.array(z.object({
+        id: z.string().optional(),
+        label: z.string().optional(),
+        proxy: z.enum(["scramjet", "ultraviolet"]).optional(),
+        proxyKind: z.enum(["scramjet", "ultraviolet"]).optional(),
+        transport: z.string().optional().describe(TRANSPORT_HINT),
+      })).optional(),
       wispUrl: z.string().optional(),
       bareUrl: z.string().optional(),
     },
@@ -99,11 +112,52 @@ function createMcp() {
   });
 
   mcp.registerTool("navigate", {
-    description: "Navigate the current session to a URL. Requires control tools.",
-    inputSchema: { url: z.string().min(1) },
-  }, async ({ url }) => {
+    description: "Navigate the current session to a URL. In a combos session this targets the active combo unless comboId or allCombos is given. Requires control tools.",
+    inputSchema: {
+      url: z.string().min(1),
+      comboId: z.string().optional(),
+      allCombos: z.boolean().optional(),
+    },
+  }, async (args) => {
     if (!allowControl) return controlDenied();
-    return textResult(await handlers.navigate({ url }));
+    return textResult(await handlers.navigate(args));
+  });
+
+  mcp.registerTool("focus_combo", {
+    description: "Switch the visible tab to a combo in a combos session (ids are in get_status → session.combos). Requires control tools.",
+    inputSchema: { comboId: z.string().min(1) },
+  }, async ({ comboId }) => {
+    if (!allowControl) return controlDenied();
+    return textResult(await handlers.focusCombo({ comboId }));
+  });
+
+  mcp.registerTool("get_tweaks", {
+    description: "Read the current launch tweaks (tab/site cloaking, load in iframe, Wisp/Proxy/Transport verbose) and verbose log file paths.",
+    inputSchema: {},
+  }, async () => textResult(await handlers.getTweaks()));
+
+  mcp.registerTool("set_tweaks", {
+    description: "Change launch tweaks, the same switches as the Apply Tweaks menu. Only the fields you pass change. They are saved and applied to the running session: cloaking is re-applied, and verbose streams are started or stopped. Verbose output goes to the log files returned in logFiles. Requires control tools.",
+    inputSchema: {
+      tabCloaking: z.boolean().optional(),
+      tabName: z.string().optional(),
+      tabIconUrl: z.string().optional(),
+      siteCloaking: z.boolean().optional(),
+      siteCloakMode: z.enum(["about:blank", "blob:https"]).optional(),
+      loadInIframe: z.boolean().optional(),
+      wispVerbose: z.boolean().optional(),
+      wispVerboseMinimized: z.boolean().optional(),
+      wispVerboseSigint: z.boolean().optional(),
+      proxyVerbose: z.boolean().optional(),
+      proxyVerboseMinimized: z.boolean().optional(),
+      proxyVerboseSigint: z.boolean().optional(),
+      transportVerbose: z.boolean().optional(),
+      transportVerboseMinimized: z.boolean().optional(),
+      transportVerboseSigint: z.boolean().optional(),
+    },
+  }, async (args) => {
+    if (!allowControl) return controlDenied();
+    return textResult(await handlers.setTweaks(args));
   });
 
   mcp.registerTool("open_inspect", {
@@ -120,14 +174,6 @@ function createMcp() {
   }, async () => {
     if (!allowControl) return controlDenied();
     return textResult(await handlers.closeInspect());
-  });
-
-  mcp.registerTool("set_split_orientation", {
-    description: "Set split view orientation to horizontal (left/right) or vertical (top/bottom). Requires control tools.",
-    inputSchema: { orientation: z.enum(["horizontal", "vertical"]) },
-  }, async ({ orientation }) => {
-    if (!allowControl) return controlDenied();
-    return textResult(await handlers.setSplitOrientation({ orientation }));
   });
 
   return mcp;
@@ -244,7 +290,10 @@ async function stop() {
   const server = httpServer;
   httpServer = null;
   boundPort = 0;
-  await new Promise((resolve) => server.close(() => resolve()));
+  const closed = new Promise((resolve) => server.close(() => resolve()));
+  // close() otherwise waits on open SSE streams and in-flight requests forever.
+  server.closeAllConnections?.();
+  await closed;
   return status();
 }
 

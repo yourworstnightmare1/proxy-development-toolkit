@@ -10,19 +10,71 @@ import {
   layoutPanels,
   slotFromPoint,
 } from "./dock-layout.mjs";
-import { initSettings, openMcpSettings } from "./settings-page.mjs";
+import { initSettings, openMcpSettings, runStartupUpdateCheck } from "./settings-page.mjs";
+import {
+  initTweaks,
+  loadTweaksFromSettings,
+  tweaks,
+  applyTabCloaking,
+  cloakedAddress,
+  ensureIframeWrapper,
+  startVerboseConsoles,
+  stopVerboseConsoles,
+  applyTweaksPatch,
+  tweakSnapshot,
+} from "./tweaks.mjs";
+import {
+  initCombos,
+  loadCombosFromSettings,
+  enabledTestCombos,
+  formatComboChip,
+} from "./combos.mjs";
+import { createMultiController } from "./multi-session.mjs";
+import { syncEruda } from "./harness/eruda.mjs";
 
 const MERCURY_WISP = "wss://wisp.mercurywork.shop/";
 const BARE_TRANSPORTS = new Set(["bare-transport", "bare-mux"]);
+const TRANSPORT_IDS = ["epoxy-tls", "wisp-js", "libcurl-transport", "bare-transport", "bare-mux"];
+const TRANSPORT_ALIASES = {
+  epoxy: "epoxy-tls",
+  "epoxy-transport": "epoxy-tls",
+  libcurl: "libcurl-transport",
+  wisp: "wisp-js",
+  wispjs: "wisp-js",
+  bare: "bare-transport",
+  baremux: "bare-mux",
+  "bare-mux-legacy": "bare-mux",
+};
+const VERBOSE_TWEAKS = new Set([
+  "wispVerbose", "wispVerboseMinimized",
+  "proxyVerbose", "proxyVerboseMinimized",
+  "transportVerbose", "transportVerboseMinimized",
+]);
+const RELOAD_TWEAKS = new Set(["siteCloaking", "siteCloakMode", "loadInIframe"]);
+
+function normalizeTransportId(value, fallback = "epoxy-tls") {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return fallback;
+  const id = TRANSPORT_ALIASES[raw] || raw;
+  if (!TRANSPORT_IDS.includes(id)) {
+    throw new Error(`Unknown transport "${value}". Use one of: ${TRANSPORT_IDS.join(", ")}.`);
+  }
+  return id;
+}
+
+function normalizeProxyKind(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw || raw === "scramjet" || raw === "sj") return "scramjet";
+  if (raw === "ultraviolet" || raw === "uv") return "ultraviolet";
+  throw new Error(`Unknown proxy "${value}". Use scramjet or ultraviolet.`);
+}
 
 const launchForm = document.getElementById("launch-form");
 const launchStatus = document.getElementById("launch-status");
 const launcher = document.getElementById("launcher");
 const frameWrap = document.getElementById("frame-wrap");
 const frame = document.getElementById("proxy-frame");
-const splitFrames = document.getElementById("split-frames");
-const frameLeft = document.getElementById("proxy-frame-left");
-const frameRight = document.getElementById("proxy-frame-right");
+const comboFrames = document.getElementById("combo-frames");
 const address = document.getElementById("address");
 const sidebar = document.getElementById("sidebar");
 const liveStatus = document.getElementById("live-status");
@@ -30,19 +82,19 @@ const sessionInfo = document.getElementById("session-info");
 const statsList = document.getElementById("stats-list");
 const statsSummary = document.getElementById("stats-summary");
 const openSessionBtn = document.getElementById("open-session");
-const enableSplit = document.getElementById("enable-split");
-const enableSplitBare = document.getElementById("enable-split-bare");
 
 const state = {
   origin: "",
   session: null,
   controller: null,
   frameHandle: null,
+  frameTarget: null,
   connection: null,
   loading: false,
   paused: false,
   stats: [],
-  splitReady: { left: false, right: false },
+  multi: null,
+  pageTitle: "",
 };
 
 const prefs = {
@@ -52,6 +104,7 @@ const prefs = {
   screenWidth: 1920,
   screenHeight: 1080,
   screenOrientation: "landscape",
+  eruda: false,
 };
 
 const tabStrip = document.getElementById("tab-strip");
@@ -74,6 +127,62 @@ function tabTitle(url) {
 function activeTab() {
   return tabs.items.find((tab) => tab.id === tabs.activeId) || tabs.items[0];
 }
+
+let lastWindowChrome = "";
+
+function currentWindowChrome() {
+  const session = state.session;
+  const cloakTitle = tweaks.tabCloaking && tweaks.tabName.trim() ? tweaks.tabName.trim() : "";
+  if (!session) return { session: false, cloakTitle };
+  if (session.mode === "multi") {
+    const combos = state.multi?.runtime.combos?.length ? state.multi.runtime.combos : session.combos || [];
+    const running = combos.filter((combo) => !combo.error);
+    const active = state.multi?.activeCombo();
+    return {
+      session: true,
+      cloakTitle,
+      siteTitle: active?.pageTitle || tabTitle(active?.bootSession?.destination || session.destination),
+      proxy: proxyLabel(active?.proxy),
+      transport: active?.transport || "",
+      tabs: combos.length,
+      proxies: new Set(running.map((combo) => combo.proxy?.kind)).size,
+      transports: new Set(running.map((combo) => combo.transport)).size,
+      wisp: Boolean(session.wispUrl) && running.some((combo) => !BARE_TRANSPORTS.has(combo.transport)),
+    };
+  }
+  return {
+    session: true,
+    cloakTitle,
+    siteTitle: state.pageTitle || tabTitle(session.destination),
+    proxy: proxyLabel(session.proxy),
+    transport: session.transport,
+    tabs: prefs.allowMultipleTabs ? tabs.items.length : 1,
+    proxies: 1,
+    transports: 1,
+    wisp: Boolean(session.wispUrl) && !BARE_TRANSPORTS.has(session.transport),
+  };
+}
+
+function updateWindowTitle() {
+  const chrome = currentWindowChrome();
+  const key = JSON.stringify(chrome);
+  if (key === lastWindowChrome) return;
+  lastWindowChrome = key;
+  void window.pdtk.setWindowChrome?.(chrome);
+}
+
+function readSinglePageTitle() {
+  if (!state.session || state.session.mode === "multi") return;
+  const target = document.getElementById("iframe-cloak-frame") || frame;
+  let title = "";
+  try { title = target?.contentDocument?.title || ""; } catch { /* cross-origin document */ }
+  state.pageTitle = title.trim();
+}
+
+setInterval(() => {
+  readSinglePageTitle();
+  updateWindowTitle();
+}, 1000);
 
 function renderTabs() {
   if (!tabList) return;
@@ -104,6 +213,11 @@ function renderTabs() {
 }
 
 function syncTabStrip() {
+  document.getElementById("tab-new")?.classList.toggle("hidden", state.session?.mode === "multi");
+  if (state.session?.mode === "multi") {
+    state.multi?.renderComboTabs();
+    return;
+  }
   const show = prefs.allowMultipleTabs && Boolean(state.session);
   tabStrip?.classList.toggle("hidden", !show);
   if (show) renderTabs();
@@ -121,8 +235,9 @@ function selectTab(id) {
   if (tab.destination && tab.destination !== state.session.destination) {
     navigate(tab.destination, { fromTab: true });
   } else if (tab.destination) {
-    address.value = tab.destination;
+    setAddressDisplay(tab.destination);
   }
+  applyTabCloaking(tab);
 }
 
 function addTab(destination = "") {
@@ -133,7 +248,7 @@ function addTab(destination = "") {
   renderTabs();
   if (state.session && destination) navigate(destination, { fromTab: true });
   else if (state.session) {
-    address.value = "";
+    setAddressDisplay("");
   }
 }
 
@@ -155,8 +270,23 @@ function rememberTabDestination(url) {
   const tab = activeTab();
   if (!tab) return;
   tab.destination = url;
-  tab.title = tabTitle(url);
+  if (tweaks.tabCloaking && tweaks.tabName.trim()) tab.title = tweaks.tabName.trim();
+  else tab.title = tabTitle(url);
   if (prefs.allowMultipleTabs) renderTabs();
+  applyTabCloaking(tab);
+}
+
+function setAddressDisplay(realUrl) {
+  if (!address) return;
+  address.dataset.realUrl = realUrl || "";
+  address.value = cloakedAddress(realUrl || "");
+  if (tweaks.siteCloaking) {
+    address.readOnly = true;
+    address.classList.add("locked");
+  } else {
+    address.readOnly = !prefs.allowUrlModification;
+    address.classList.toggle("locked", !prefs.allowUrlModification);
+  }
 }
 
 function applyBrowserPrefs(settings) {
@@ -167,14 +297,29 @@ function applyBrowserPrefs(settings) {
   prefs.screenWidth = Number(settings.screenWidth) || 1920;
   prefs.screenHeight = Number(settings.screenHeight) || 1080;
   prefs.screenOrientation = settings.screenOrientation === "portrait" ? "portrait" : "landscape";
-  address.readOnly = !prefs.allowUrlModification;
-  address.classList.toggle("locked", !prefs.allowUrlModification);
-  syncTabStrip();
-  if (state.session?.mode === "split") {
-    postToPanes({ type: "pdtk-screen", screen: screenPrefs() });
-  } else {
-    applyScreenSpoofTo(frame?.contentWindow);
+  prefs.eruda = Boolean(settings.eruda);
+  if (state.session?.destination) setAddressDisplay(state.session.destination);
+  else {
+    address.readOnly = !prefs.allowUrlModification;
+    address.classList.toggle("locked", !prefs.allowUrlModification);
   }
+  syncTabStrip();
+  if (state.session?.mode === "multi") {
+    state.multi?.postToAll({ type: "pdtk-screen", screen: screenPrefs() });
+    state.multi?.postToAll({ type: "pdtk-eruda", enabled: prefs.eruda });
+  } else {
+    applyScreenSpoofTo(activeProxyFrame()?.contentWindow);
+    if (state.session) syncEruda(activeProxyFrame()?.contentWindow, prefs.eruda);
+  }
+}
+
+function activeProxyFrame() {
+  if (tweaks.loadInIframe && state.session?.mode !== "multi") {
+    ensureIframeWrapper(true);
+    return document.getElementById("iframe-cloak-frame") || frame;
+  }
+  ensureIframeWrapper(false);
+  return frame;
 }
 
 function screenPrefs() {
@@ -205,7 +350,12 @@ function applyScreenSpoofTo(win) {
 }
 
 function localWisp() {
-  return `ws://${location.host}/wisp/`;
+  return `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/wisp/`;
+}
+
+function defaultWisp() {
+  // Prefer the in-app Wisp endpoint. The public Mercury demo host is often unreachable.
+  return localWisp();
 }
 
 const proxyPaneState = {
@@ -214,49 +364,8 @@ const proxyPaneState = {
   right: { importMode: null, git: null },
 };
 let siteMode = "url";
+let devServerUrl = "";
 let siteGit = null;
-
-function splitEnabled() {
-  return Boolean(enableSplit?.checked || enableSplitBare?.checked);
-}
-
-function syncSplitCheckboxes(checked) {
-  if (enableSplit) enableSplit.checked = checked;
-  if (enableSplitBare) enableSplitBare.checked = checked;
-}
-
-function splitOrientation() {
-  const bare = BARE_TRANSPORTS.has(document.getElementById("transport").value);
-  const group = bare ? "split-orientation-bare" : "split-orientation";
-  const selected = document.querySelector(`input[name="${group}"]:checked`);
-  return selected?.value === "vertical" ? "vertical" : "horizontal";
-}
-
-function syncSplitOrientation(value) {
-  const next = value === "vertical" ? "vertical" : "horizontal";
-  for (const name of ["split-orientation", "split-orientation-bare"]) {
-    const input = document.querySelector(`input[name="${name}"][value="${next}"]`);
-    if (input) input.checked = true;
-  }
-}
-
-function applySplitOrientation(orientation) {
-  const vertical = orientation === "vertical";
-  splitFrames.classList.toggle("vertical", vertical);
-  document.getElementById("proxy-split")?.classList.toggle("vertical-labels", vertical);
-  const first = vertical ? "Top" : "Left";
-  const second = vertical ? "Bottom" : "Right";
-  const leftLabel = document.getElementById("proxy-label-left");
-  const rightLabel = document.getElementById("proxy-label-right");
-  if (leftLabel) leftLabel.textContent = `${first} proxy`;
-  if (rightLabel) rightLabel.textContent = `${second} proxy`;
-  if (state.session?.mode === "split") {
-    const leftName = proxyLabel(state.session.panes?.[0]?.proxy);
-    const rightName = proxyLabel(state.session.panes?.[1]?.proxy);
-    document.getElementById("split-label-left").textContent = `${first}: ${leftName}`;
-    document.getElementById("split-label-right").textContent = `${second}: ${rightName}`;
-  }
-}
 
 function proxyCombo(pane) {
   return document.querySelector(`.combo[data-proxy-pane="${pane}"]`);
@@ -328,6 +437,9 @@ function syncSiteFields() {
   const url = document.getElementById("site-url");
   url.placeholder = siteMode === "git" ? "https://github.com/owner/site" : "https://example.com";
   document.getElementById("site-subdir").classList.toggle("hidden", siteMode === "url");
+  document.getElementById("dev-server-row")?.classList.toggle("hidden", siteMode === "url");
+  document.getElementById("dev-server-deps")?.classList.toggle("hidden", siteMode === "url");
+  void paintDevDeps();
 }
 
 function syncProxyFields(pane = "single") {
@@ -341,16 +453,9 @@ function syncProxyFields(pane = "single") {
 }
 
 function syncSplitUi() {
-  const on = splitEnabled();
-  document.getElementById("proxy-split").classList.toggle("hidden", !on);
-  document.getElementById("proxy-transport-row").classList.toggle("split-mode", on);
-  document.getElementById("split-orientation-field")?.classList.toggle("hidden", !on);
-  document.getElementById("split-orientation-field-bare")?.classList.toggle("hidden", !on);
-  openSessionBtn.textContent = on ? "Start Split View" : "Start Session";
-  applySplitOrientation(splitOrientation());
+  const n = enabledTestCombos().length;
+  openSessionBtn.textContent = n ? `Start ${n} Combo${n === 1 ? "" : "s"}` : "Start Session";
   syncProxyFields("single");
-  syncProxyFields("left");
-  syncProxyFields("right");
 }
 
 function joinBase(base, file) {
@@ -411,9 +516,10 @@ function wrapTransport(transport) {
       if (body instanceof Blob) body = await body.arrayBuffer();
       const started = performance.now();
       try {
+        const headerList = asTuples(headers);
         const response = transport.client?.fetch
-          ? await transport.client.fetch(remote.href, { method, body, headers, redirect: "manual", signal })
-          : await transport.request(remote, method, body, asTuples(headers), signal);
+          ? await transport.client.fetch(remote.href, { method, body, headers: headerList, redirect: "manual", signal })
+          : await transport.request(remote, method, body, headerList, signal);
         reportTransport({
           phase: "done",
           method,
@@ -464,7 +570,7 @@ async function createRawTransport(session) {
     return client;
   }
   if (session.transport === "libcurl-transport") {
-    const mod = await withoutProcess(() => import("/libcurl/index.mjs"));
+    const mod = await withoutProcess(() => import("/harness/libcurl-transport.mjs"));
     const client = new mod.default({ wisp: session.wispUrl });
     await client.init();
     return client;
@@ -484,24 +590,51 @@ async function createRawTransport(session) {
   return client;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+function waitForActivation(worker) {
+  if (!worker || worker.state === "activated" || worker.state === "redundant") return Promise.resolve();
+  return new Promise((resolve) => {
+    const onChange = () => {
+      if (worker.state !== "activated" && worker.state !== "redundant") return;
+      worker.removeEventListener("statechange", onChange);
+      resolve();
+    };
+    worker.addEventListener("statechange", onChange);
+  });
+}
+
+// A retired worker from the previous session can still be `controller`; only the
+// registration's current active worker has this session's transport attached.
+async function workerControlsPage(registration, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const pending = registration.installing || registration.waiting;
+    if (pending) {
+      await Promise.race([waitForActivation(pending), sleep(deadline - Date.now())]);
+      continue;
+    }
+    if (registration.active && navigator.serviceWorker.controller === registration.active) return true;
+    await Promise.race([
+      new Promise((resolve) => navigator.serviceWorker.addEventListener("controllerchange", resolve, { once: true })),
+      sleep(Math.min(250, deadline - Date.now())),
+    ]);
+  }
+  return false;
+}
+
 async function registerWorker() {
   if (!navigator.serviceWorker) throw new Error("Service workers are not available.");
-  const registrations = await navigator.serviceWorker.getRegistrations();
-  await Promise.all(registrations.map((registration) => registration.unregister()));
-  const registration = await navigator.serviceWorker.register("/sw.js", {
-    scope: "/",
-    updateViaCache: "none",
-  });
+  const options = { scope: "/", updateViaCache: "none" };
+  let registration = await navigator.serviceWorker.register("/sw.js", options);
   await registration.update().catch(() => {});
-  await navigator.serviceWorker.ready;
-  if (navigator.serviceWorker.controller) return;
-  await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("Timed out waiting for the service worker")), 8000);
-    navigator.serviceWorker.addEventListener("controllerchange", () => {
-      clearTimeout(timer);
-      resolve();
-    }, { once: true });
-  });
+  if (await workerControlsPage(registration, 4000)) return;
+  await registration.unregister().catch(() => {});
+  registration = await navigator.serviceWorker.register("/sw.js", options);
+  if (await workerControlsPage(registration, 8000)) return;
+  throw new Error("Timed out waiting for the service worker");
 }
 
 async function bootScramjet(session) {
@@ -570,7 +703,7 @@ async function bootUltraviolet(session) {
   } else if (session.transport === "wisp-js") {
     await state.connection.setTransport("/harness/wisp-js-transport.mjs", [{ wisp: session.wispUrl }]);
   } else if (session.transport === "libcurl-transport") {
-    await state.connection.setTransport("/libcurl/index.mjs", [{ wisp: session.wispUrl }]);
+    await state.connection.setTransport("/harness/libcurl-transport.mjs", [{ wisp: session.wispUrl }]);
   } else {
     await state.connection.setTransport("/epoxy/index.mjs", [{ wisp: session.wispUrl }]);
   }
@@ -580,37 +713,51 @@ function proxiedHref(url) {
   return new URL(__uv$config.prefix + __uv$config.encodeUrl(url), location.origin).href;
 }
 
+function syncMainSession() {
+  if (!state.session) return;
+  window.pdtk.setSession(state.session).catch(() => {});
+}
+
 function navigate(url, options = {}) {
   if (!state.session) return;
   const next = normalizeHttp(url);
   if (!prefs.allowSiteRedirects && !options.fromUser && !options.fromTab && !options.fromMcp) {
     if (state.session.destination && next !== state.session.destination) {
-      address.value = state.session.destination;
+      setAddressDisplay(state.session.destination);
       return;
     }
   }
   state.session.destination = next;
-  address.value = next;
+  setAddressDisplay(next);
   rememberTabDestination(next);
+  syncMainSession();
   state.loading = true;
-  if (state.session.mode === "split") {
-    postToPanes({ type: "pdtk-navigate", url: next });
+  if (state.session.mode === "multi") {
+    const active = state.multi?.activeCombo();
+    if (active) {
+      active.bootSession = { ...active.bootSession, destination: next };
+      state.multi.postToActive({ type: "pdtk-navigate", url: next });
+    }
     return;
   }
+  const target = activeProxyFrame();
   if (state.session.proxy.kind === "scramjet") {
-    if (!state.frameHandle) state.frameHandle = state.controller.createFrame(frame);
+    if (!state.frameHandle || state.frameTarget !== target) {
+      state.frameHandle = state.controller.createFrame(target);
+      state.frameTarget = target;
+    }
     state.frameHandle.go(next);
     return;
   }
   if (state.session.proxy.kind === "ultraviolet") {
-    frame.src = proxiedHref(next);
+    target.src = proxiedHref(next);
     return;
   }
   const entry = state.session.proxy.index
     ? joinBase(state.session.proxy.base, state.session.proxy.index)
     : `/${state.session.proxy.base}/`;
   const glue = entry.includes("?") ? "&" : "?";
-  frame.src = `${entry}${glue}url=${encodeURIComponent(next)}`;
+  target.src = `${entry}${glue}url=${encodeURIComponent(next)}`;
   setStatus(liveStatus, "Imported proxy has no Scramjet or Ultraviolet entry. Live transport injection may not apply.");
 }
 
@@ -626,22 +773,17 @@ function renderSession() {
   }
   const rows = [
     ["Site", session.destination],
-    ["Mode", session.mode === "split"
-      ? `Split view (${session.orientation === "vertical" ? "top / bottom" : "left / right"})`
-      : "Single"],
+    ["Mode", session.mode === "multi" ? `Test combos (${session.combos?.length || 0})` : "Single"],
   ];
-  if (session.mode === "split") {
-    const first = session.orientation === "vertical" ? "Top" : "Left";
-    const second = session.orientation === "vertical" ? "Bottom" : "Right";
-    rows.push(
-      [first, proxyLabel(session.panes?.[0]?.proxy)],
-      [second, proxyLabel(session.panes?.[1]?.proxy)]
-    );
+  if (session.mode === "multi") {
+    for (const combo of session.combos || []) {
+      rows.push([combo.label || combo.id, `${proxyLabel(combo.proxy)} · ${combo.transport}`]);
+    }
   } else {
     rows.push(["Proxy", proxyLabel(session.proxy)]);
+    rows.push(["Transport", session.transport]);
   }
   rows.push(
-    ["Transport", session.transport],
     ["Wisp", session.wispUrl || "—"],
     ["Bare", session.bareUrl || "—"]
   );
@@ -652,13 +794,15 @@ function fillLiveProxy() {
   const select = document.getElementById("live-proxy");
   const splitNote = document.getElementById("live-proxy-split");
   const label = select.closest("label");
-  if (state.session?.mode === "split") {
+  if (state.session?.mode === "multi") {
+    const active = state.multi?.activeCombo();
     select.classList.add("hidden");
     if (label) label.classList.add("hidden");
     splitNote.classList.remove("hidden");
-    const first = state.session.orientation === "vertical" ? "Top" : "Left";
-    const second = state.session.orientation === "vertical" ? "Bottom" : "Right";
-    splitNote.textContent = `${first}: ${proxyLabel(state.session.panes?.[0]?.proxy)} · ${second}: ${proxyLabel(state.session.panes?.[1]?.proxy)}`;
+    splitNote.textContent = active
+      ? `${active.label}: ${proxyLabel(active.proxy)} · ${active.transport}`
+      : "No active combo";
+    state.multi?.syncLiveComboSelect();
     return;
   }
   select.classList.remove("hidden");
@@ -683,15 +827,19 @@ function syncSessionChrome(active) {
 function showSession() {
   launcher.classList.add("hidden");
   frameWrap.classList.remove("hidden");
-  const split = state.session?.mode === "split";
-  frameWrap.classList.toggle("split", split);
-  splitFrames.classList.toggle("hidden", !split);
-  frame.classList.toggle("hidden", split);
-  if (split) applySplitOrientation(state.session.orientation || "horizontal");
+  const multi = state.session?.mode === "multi";
+  frameWrap.classList.toggle("split", false);
+  comboFrames?.classList.toggle("hidden", !multi);
+  frame.classList.toggle("hidden", multi);
   syncSessionChrome(true);
   applyDock();
   fillLiveProxy();
-  document.getElementById("live-transport").value = state.session.transport;
+  if (!multi) {
+    document.getElementById("live-transport").value = state.session.transport;
+  } else {
+    const active = state.multi?.activeCombo();
+    if (active) document.getElementById("live-transport").value = active.transport;
+  }
   document.getElementById("live-wisp").value = state.session.wispUrl || "";
   document.getElementById("live-bare").value = state.session.bareUrl || "";
   syncTransportFields();
@@ -699,99 +847,62 @@ function showSession() {
   syncTabStrip();
 }
 
-function postToPanes(message) {
-  for (const node of [frameLeft, frameRight]) {
-    try {
-      node.contentWindow?.postMessage(message, "*");
-    } catch { /* ignore */ }
-  }
-}
-
-function waitForPaneReady(pane, timeoutMs = 20000) {
-  return new Promise((resolve, reject) => {
-    if (state.splitReady[pane]) {
-      resolve();
-      return;
-    }
-    const timer = setTimeout(() => {
-      window.removeEventListener("message", onMessage);
-      reject(new Error(`Timed out starting the ${pane} pane.`));
-    }, timeoutMs);
-    function onMessage(event) {
-      const data = event.data;
-      if (!data || data.type !== "pdtk-ready" || data.pane !== pane) return;
-      state.splitReady[pane] = true;
-      clearTimeout(timer);
-      window.removeEventListener("message", onMessage);
-      resolve();
-    }
-    window.addEventListener("message", onMessage);
-  });
-}
-
-async function bootPane(iframe, paneSession, origin) {
-  state.splitReady[paneSession.pane] = false;
-  const readyPromise = waitForPaneReady(paneSession.pane);
-  await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`Timed out loading ${paneSession.pane} pane.`)), 15000);
-    iframe.onload = () => {
-      clearTimeout(timer);
-      resolve();
-    };
-    iframe.onerror = () => {
-      clearTimeout(timer);
-      reject(new Error(`Failed to load ${paneSession.pane} pane.`));
-    };
-    iframe.src = `${origin}/harness/pane.html`;
-  });
-  iframe.contentWindow.postMessage({
-    type: "pdtk-boot",
-    session: { ...paneSession, screen: screenPrefs() },
-  }, origin);
-  await readyPromise;
-}
-
-async function startSplitSession(session) {
+async function startMultiSession(session) {
   state.session = session;
   state.controller = null;
   state.frameHandle = null;
-  state.splitReady = { left: false, right: false };
-  applySplitOrientation(session.orientation || "horizontal");
+  if (!state.multi) {
+    state.multi = createMultiController({
+      frameWrap,
+      proxyFrame: frame,
+      comboFramesEl: comboFrames,
+      tabStrip,
+      tabList,
+      setStatus,
+      liveStatus,
+      screenPrefs,
+      erudaEnabled: () => prefs.eruda,
+      onActiveChanged: (combo) => {
+        if (!combo) {
+          if (state.session?.mode === "multi") {
+            endSession().catch((error) => setStatus(liveStatus, error.message || String(error), true));
+          }
+          return;
+        }
+        if (!state.session) return;
+        document.getElementById("live-transport").value = combo.transport;
+        fillLiveProxy();
+        renderSession();
+        updateWindowTitle();
+      },
+    });
+  }
   showSession();
-  setStatus(liveStatus, "Starting split view…");
-  await Promise.all([
-    bootPane(frameLeft, {
-      ...session,
-      proxy: session.panes[0].proxy,
-      pane: "left",
-      destination: session.destination,
-    }, session.panes[0].origin),
-    bootPane(frameRight, {
-      ...session,
-      proxy: session.panes[1].proxy,
-      pane: "right",
-      destination: session.destination,
-    }, session.panes[1].origin),
-  ]);
-  address.value = session.destination;
+  const outcome = await state.multi.start(session);
+  setAddressDisplay(session.destination);
   rememberTabDestination(session.destination);
   state.loading = false;
-  const notes = ["Split view ready."];
-  if (session.localSite && session.wispUrl) {
-    notes.push(`Local files are reached through ${session.wispUrl}.`);
-  }
-  setStatus(liveStatus, notes.join(" "));
   await window.pdtk.setSession(session);
+  updateWindowTitle();
+  return outcome;
 }
 
 async function startSession(session) {
-  if (session.mode === "split") {
-    await startSplitSession(session);
-    return;
+  if (session.mode === "multi") {
+    const outcome = await startMultiSession(session);
+    await startVerboseConsoles().catch((error) => {
+      setStatus(liveStatus, error.message || String(error), true);
+    });
+    applyTabCloaking(activeTab());
+    ensureIframeWrapper(false);
+    setAddressDisplay(session.destination);
+    updateWindowTitle();
+    return outcome;
   }
   state.session = session;
   state.controller = null;
   state.frameHandle = null;
+  state.frameTarget = null;
   showSession();
   setStatus(liveStatus, "Starting proxy…");
   if (session.proxy.kind === "scramjet") await bootScramjet(session);
@@ -799,7 +910,11 @@ async function startSession(session) {
   else setStatus(liveStatus, "Opaque imported proxy. Live transport injection may not apply.");
   navigate(session.destination, { fromUser: true });
   rememberTabDestination(session.destination);
-  applyScreenSpoofTo(frame?.contentWindow);
+  applyScreenSpoofTo(activeProxyFrame()?.contentWindow);
+  applyTabCloaking(activeTab());
+  await startVerboseConsoles().catch((error) => {
+    setStatus(liveStatus, error.message || String(error), true);
+  });
   const notes = ["Session ready."];
   if (session.proxy.kind === "opaque") {
     notes.push("This import is not Scramjet or Ultraviolet, so live transport injection may not apply.");
@@ -809,11 +924,14 @@ async function startSession(session) {
   }
   if (!liveStatus.textContent.startsWith("Legacy")) setStatus(liveStatus, notes.join(" "));
   await window.pdtk.setSession(session);
+  updateWindowTitle();
+  return null;
 }
 
 async function prepareSite() {
   const mode = siteMode;
   const sub = document.getElementById("site-subdir").value.trim().replace(/^\/+|\/+$/g, "");
+  if (devServerUrl) return { destination: sub ? `${devServerUrl}${sub}/` : devServerUrl, local: true };
   if (mode === "url") return { destination: normalizeHttp(document.getElementById("site-url").value), local: false };
   let imported;
   if (mode === "folder") {
@@ -862,7 +980,7 @@ function readEndpoints(localSite, transportId, wispInput, bareInput) {
   if (BARE_TRANSPORTS.has(transport)) {
     return { transport, wispUrl: "", bareUrl: normalizeBare(bareInput) };
   }
-  const fallback = localSite ? localWisp() : MERCURY_WISP;
+  const fallback = defaultWisp();
   return { transport, wispUrl: normalizeWisp(wispInput, fallback), bareUrl: "" };
 }
 
@@ -870,36 +988,49 @@ launchForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   openSessionBtn.disabled = true;
   setSessionServerState("starting");
-  setStatus(launchStatus, splitEnabled() ? "Preparing split view…" : "Preparing session…");
+  const enabledCombos = enabledTestCombos();
+  setStatus(launchStatus, enabledCombos.length ? "Preparing test combos…" : "Preparing session…");
   try {
     const site = await prepareSite();
-    const endpoints = readEndpoints(
-      site.local,
-      document.getElementById("transport").value,
-      document.getElementById("wisp-url").value,
-      document.getElementById("bare-url").value
-    );
-    if (site.local && !BARE_TRANSPORTS.has(endpoints.transport)) {
-      endpoints.wispUrl = localWisp();
-    }
-    if (splitEnabled()) {
-      const hosts = await window.pdtk.ensureSplitHosts();
-      const leftProxy = await prepareProxy("left");
-      const rightProxy = await prepareProxy("right");
+    if (enabledCombos.length) {
+      const needsBare = enabledCombos.some((c) => BARE_TRANSPORTS.has(c.transport));
+      const needsWisp = enabledCombos.some((c) => !BARE_TRANSPORTS.has(c.transport));
+      let wispUrl = "";
+      let bareUrl = "";
+      if (needsWisp) {
+        wispUrl = normalizeWisp(document.getElementById("wisp-url").value, defaultWisp());
+        if (site.local) wispUrl = localWisp();
+      }
+      if (needsBare) bareUrl = normalizeBare(document.getElementById("bare-url").value);
+      const hosts = await window.pdtk.ensureComboHosts({ count: enabledCombos.length });
       const session = {
-        mode: "split",
-        orientation: splitOrientation(),
+        mode: "multi",
         destination: site.destination,
         localSite: site.local,
-        ...endpoints,
-        panes: [
-          { id: "left", proxy: leftProxy, port: hosts.leftPort, origin: hosts.leftOrigin },
-          { id: "right", proxy: rightProxy, port: hosts.rightPort, origin: hosts.rightOrigin },
-        ],
+        wispUrl,
+        bareUrl,
+        transport: enabledCombos[0].transport,
+        combos: enabledCombos.map((combo, index) => ({
+          id: combo.id,
+          label: formatComboChip(combo),
+          proxy: { kind: combo.proxyKind, label: combo.proxyKind === "ultraviolet" ? "Ultraviolet" : "Scramjet" },
+          transport: combo.transport,
+          port: hosts.hosts[index].port,
+          origin: hosts.hosts[index].origin,
+        })),
       };
       await window.pdtk.setSession(session);
       await startSession(session);
     } else {
+      const endpoints = readEndpoints(
+        site.local,
+        document.getElementById("transport").value,
+        document.getElementById("wisp-url").value,
+        document.getElementById("bare-url").value
+      );
+      if (site.local && !BARE_TRANSPORTS.has(endpoints.transport)) {
+        endpoints.wispUrl = localWisp();
+      }
       const proxy = await prepareProxy("single");
       const session = {
         mode: "single",
@@ -914,66 +1045,140 @@ launchForm.addEventListener("submit", async (event) => {
     setStatus(launchStatus, "");
     setSessionServerState("ready");
   } catch (error) {
+    if (devServerUrl) await window.pdtk.stopDevServer?.().catch(() => {});
     setStatus(launchStatus, error.message || String(error), true);
     setSessionServerState("error", error.message || String(error));
     setStatus(liveStatus, error.message || String(error), true);
     launcher.classList.remove("hidden");
     frameWrap.classList.add("hidden");
-    frameWrap.classList.remove("split");
-    splitFrames.classList.add("hidden");
+    comboFrames?.classList.add("hidden");
     syncSessionChrome(false);
   } finally {
     openSessionBtn.disabled = false;
+    devServerUrl = "";
   }
+});
+
+async function devServerFolder() {
+  if (siteMode === "folder") return document.getElementById("site-folder").value;
+  if (siteMode !== "git") return "";
+  if (!siteGit?.path) {
+    setStatus(launchStatus, "Cloning repository…");
+    siteGit = await window.pdtk.importGit({ kind: "site", url: document.getElementById("site-url").value.trim() });
+    void paintDevDeps();
+  }
+  return siteGit.path || "";
+}
+
+const DEV_DEP_LABELS = { npm: "npm", pnpm: "pnpm", yarn: "Yarn", bun: "Bun" };
+let devDepsToken = 0;
+
+async function paintDevDeps() {
+  const hint = document.getElementById("dev-server-deps");
+  if (!hint) return;
+  const token = ++devDepsToken;
+  const folder = siteMode === "folder" ? document.getElementById("site-folder").value : siteMode === "git" ? siteGit?.path : "";
+  if (!folder || !window.pdtk.detectDevDeps) {
+    hint.textContent = siteMode === "git" ? "Dependencies are detected after the repository is cloned." : "";
+    return;
+  }
+  const found = await window.pdtk.detectDevDeps({ folder }).catch(() => null);
+  if (token !== devDepsToken) return;
+  const parts = [];
+  if (found?.python?.files?.length) parts.push(`Python: ${found.python.files.join(", ")}${found.python.venv ? ` (uses ${found.python.venv})` : ""}`);
+  if (found?.node?.hasDeps) parts.push(`Node: ${DEV_DEP_LABELS[found.node.manager] || found.node.manager}${found.node.lockfile ? ` (${found.node.lockfile})` : ""}`);
+  hint.textContent = parts.length
+    ? `Detected dependencies, installed automatically before the server starts. ${parts.join(" · ")}`
+    : "No Python or Node dependencies detected.";
+}
+
+async function startWithDevServer(runtime) {
+  const buttons = [...document.querySelectorAll("#dev-server-row button")];
+  const name = runtime === "node" ? "node.js" : "Python";
+  buttons.forEach((button) => { button.disabled = true; });
+  openSessionBtn.disabled = true;
+  setSessionServerState("starting", `Starting ${name} server…`);
+  setStatus(launchStatus, `Starting ${name} server…`);
+  try {
+    const folder = await devServerFolder();
+    if (!folder) throw new Error("Choose a site folder or clone a repository first.");
+    const result = await window.pdtk.startDevServer({ runtime, folder });
+    if (!result?.ok) throw new Error(result?.error || `Could not start the ${name} server.`);
+    setStatus(launchStatus, `${result.command} is serving on ${result.url}`);
+    devServerUrl = result.url;
+    launchForm.requestSubmit();
+  } catch (error) {
+    setStatus(launchStatus, error.message || String(error), true);
+    setSessionServerState("error", error.message || String(error));
+    openSessionBtn.disabled = false;
+  } finally {
+    buttons.forEach((button) => { button.disabled = false; });
+  }
+}
+
+document.getElementById("start-python")?.addEventListener("click", () => void startWithDevServer("python"));
+document.getElementById("start-node")?.addEventListener("click", () => void startWithDevServer("node"));
+window.pdtk.onDevServerEvent?.((event) => {
+  if (event?.stage && !state.session) setStatus(launchStatus, event.stage);
 });
 
 document.getElementById("omnibox").addEventListener("submit", (event) => {
   event.preventDefault();
   if (!state.session) return;
-  if (!prefs.allowUrlModification) return;
+  if (!prefs.allowUrlModification || tweaks.siteCloaking) return;
   const url = normalizeHttp(address.value);
   navigate(url, { fromUser: true });
 });
 
 document.getElementById("back").addEventListener("click", () => {
-  if (state.session?.mode === "split") {
-    postToPanes({ type: "pdtk-back" });
+  if (state.session?.mode === "multi") {
+    state.multi?.postToActive({ type: "pdtk-back" });
     return;
   }
   if (state.frameHandle?.back) state.frameHandle.back();
-  else frame.contentWindow?.history.back();
+  else activeProxyFrame()?.contentWindow?.history.back();
 });
 document.getElementById("forward").addEventListener("click", () => {
-  if (state.session?.mode === "split") {
-    postToPanes({ type: "pdtk-forward" });
+  if (state.session?.mode === "multi") {
+    state.multi?.postToActive({ type: "pdtk-forward" });
     return;
   }
   if (state.frameHandle?.forward) state.frameHandle.forward();
-  else frame.contentWindow?.history.forward();
+  else activeProxyFrame()?.contentWindow?.history.forward();
 });
 document.getElementById("reload").addEventListener("click", () => {
   if (state.loading) {
-    if (state.session?.mode === "split") {
-      frameLeft.contentWindow?.stop?.();
-      frameRight.contentWindow?.stop?.();
+    if (state.session?.mode === "multi") {
+      const active = state.multi?.activeCombo();
+      if (active && !active.poppedOut) {
+        document.querySelector(`iframe[data-combo-id="${CSS.escape(active.id)}"]`)?.contentWindow?.stop?.();
+      }
     } else {
-      frame.contentWindow?.stop();
+      activeProxyFrame()?.contentWindow?.stop();
     }
     state.loading = false;
     return;
   }
-  if (state.session?.mode === "split") {
-    postToPanes({ type: "pdtk-reload" });
+  if (state.session?.mode === "multi") {
+    state.multi?.postToActive({ type: "pdtk-reload" });
     return;
   }
   if (state.frameHandle?.reload) state.frameHandle.reload();
   else if (state.session) navigate(state.session.destination);
 });
 
-frame.addEventListener("load", () => {
+frameWrap.addEventListener("load", (event) => {
+  if (event.target?.tagName !== "IFRAME") return;
+  if (state.session?.mode === "multi") {
+    state.loading = false;
+    return;
+  }
+  const target = activeProxyFrame();
+  if (event.target !== target && event.target !== frame) return;
   state.loading = false;
+  if (prefs.eruda) syncEruda(event.target.contentWindow, true);
   try {
-    const href = frame.contentWindow?.location?.href;
+    const href = target?.contentWindow?.location?.href;
     if (state.session?.proxy.kind === "ultraviolet" && href && globalThis.__uv$config) {
       const path = new URL(href).pathname;
       if (path.startsWith(__uv$config.prefix)) {
@@ -982,12 +1187,41 @@ frame.addEventListener("load", () => {
           navigate(state.session.destination, { fromUser: true });
           return;
         }
-        address.value = decoded;
         state.session.destination = decoded;
+        setAddressDisplay(decoded);
         rememberTabDestination(decoded);
       }
     }
   } catch { /* proxied document may hide location */ }
+}, true);
+
+async function applyTweakChanges(keys = []) {
+  const changed = new Set(keys);
+  updateWindowTitle();
+  if (!state.session) return { reloaded: false, verboseRestarted: false };
+  setAddressDisplay(state.session.destination || "");
+  applyTabCloaking(activeTab());
+  let reloaded = false;
+  const needsReload = !changed.size || [...changed].some((key) => RELOAD_TWEAKS.has(key));
+  if (needsReload && state.session.mode !== "multi" && state.session.destination) {
+    navigate(state.session.destination, { fromUser: true });
+    reloaded = true;
+  }
+  let verboseRestarted = false;
+  if ([...changed].some((key) => VERBOSE_TWEAKS.has(key))) {
+    await stopVerboseConsoles().catch(() => {});
+    await startVerboseConsoles();
+    verboseRestarted = true;
+  }
+  updateWindowTitle();
+  return { reloaded, verboseRestarted };
+}
+
+window.addEventListener("pdtk-tweaks-changed", (event) => {
+  if (event.detail?.fromMcp) return;
+  applyTweakChanges(event.detail?.keys || []).catch((error) => {
+    setStatus(liveStatus, error.message || String(error), true);
+  });
 });
 
 document.getElementById("sidebar-toggle").addEventListener("click", () => {
@@ -1013,12 +1247,36 @@ document.getElementById("apply-live").addEventListener("click", async () => {
       endpoints.wispUrl = localWisp();
       document.getElementById("live-wisp").value = endpoints.wispUrl;
     }
-    if (state.session.mode === "split") {
-      Object.assign(state.session, endpoints);
+    if (state.session.mode === "multi") {
+      const active = state.multi?.activeCombo();
+      Object.assign(state.session, {
+        wispUrl: endpoints.wispUrl,
+        bareUrl: endpoints.bareUrl,
+      });
+      if (active) {
+        active.transport = endpoints.transport;
+        active.bootSession = {
+          ...active.bootSession,
+          transport: endpoints.transport,
+          wispUrl: endpoints.wispUrl,
+          bareUrl: endpoints.bareUrl,
+        };
+        state.session.combos = state.session.combos.map((item) => (
+          item.id === active.id ? { ...item, transport: endpoints.transport } : item
+        ));
+        state.multi.postToActive({
+          type: "pdtk-apply",
+          session: {
+            transport: endpoints.transport,
+            wispUrl: endpoints.wispUrl,
+            bareUrl: endpoints.bareUrl,
+          },
+        });
+      }
       await window.pdtk.setSession(state.session);
-      postToPanes({ type: "pdtk-apply", session: { ...endpoints } });
+      fillLiveProxy();
       renderSession();
-      setStatus(liveStatus, "Applied to both panes.");
+      setStatus(liveStatus, active ? `Applied to ${active.label}.` : "Applied.");
       return;
     }
     const nextKind = document.getElementById("live-proxy").value;
@@ -1052,26 +1310,31 @@ document.getElementById("apply-live").addEventListener("click", async () => {
 });
 
 async function endSession() {
+  await stopVerboseConsoles().catch(() => {});
+  await window.pdtk.stopDevServer?.().catch(() => {});
+  ensureIframeWrapper(false);
+  if (state.multi) await state.multi.end().catch(() => {});
   await window.pdtk.clearSession();
   const registrations = await navigator.serviceWorker.getRegistrations();
   await Promise.all(registrations.map((registration) => registration.unregister()));
   frame.src = "about:blank";
-  frameLeft.src = "about:blank";
-  frameRight.src = "about:blank";
   state.session = null;
   state.controller = null;
   state.frameHandle = null;
-  state.splitReady = { left: false, right: false };
+  state.frameTarget = null;
   launcher.classList.remove("hidden");
   frameWrap.classList.add("hidden");
   frameWrap.classList.remove("split");
-  splitFrames.classList.add("hidden");
+  comboFrames?.classList.add("hidden");
   frame.classList.remove("hidden");
   sidebar.classList.add("collapsed");
   syncSessionChrome(false);
   applyDock();
   setStatus(liveStatus, "");
   syncTabStrip();
+  document.title = "Proxy Development Toolkit";
+  state.pageTitle = "";
+  updateWindowTitle();
   return { ok: true };
 }
 
@@ -1178,30 +1441,11 @@ document.querySelectorAll(".proxy-custom-clear").forEach((button) => {
   });
 });
 
-function onSplitToggle(event) {
-  syncSplitCheckboxes(event.target.checked);
-  syncSplitUi();
-}
-enableSplit?.addEventListener("change", onSplitToggle);
-enableSplitBare?.addEventListener("change", onSplitToggle);
-
-document.querySelectorAll('input[name="split-orientation"], input[name="split-orientation-bare"]').forEach((input) => {
-  input.addEventListener("change", () => {
-    syncSplitOrientation(input.value);
-    applySplitOrientation(input.value);
-    if (state.session?.mode === "split") {
-      state.session.orientation = input.value === "vertical" ? "vertical" : "horizontal";
-      window.pdtk.setSession(state.session);
-      renderSession();
-    }
-  });
-});
-
 window.addEventListener("message", (event) => {
   const data = event.data;
   if (!data || typeof data !== "object") return;
-  if (data.type === "pdtk-ready" && data.pane) {
-    state.splitReady[data.pane] = true;
+  if (data.type === "pdtk-ready" && (data.pane || data.comboId)) {
+    state.multi?.markReady(data.comboId || data.pane);
     return;
   }
   if (data.type === "pdtk-error") {
@@ -1210,8 +1454,26 @@ window.addEventListener("message", (event) => {
   }
   if (data.type === "pdtk-stat" && data.detail) {
     reportTransport(data.detail);
+    return;
+  }
+  if (data.type === "pdtk-title" && state.session?.mode === "multi") {
+    if (state.multi?.setPageTitle(data.comboId || data.pane, data.title)) updateWindowTitle();
   }
 });
+
+document.getElementById("live-combo")?.addEventListener("change", (event) => {
+  state.multi?.focusCombo(event.target.value);
+});
+document.getElementById("combo-popout")?.addEventListener("click", () => {
+  const active = state.multi?.activeCombo();
+  if (active) void state.multi.togglePopout(active.id);
+});
+window.pdtk.onComboWindowClosed?.((payload) => {
+  const id = payload?.comboId;
+  if (!id || state.session?.mode !== "multi") return;
+  void state.multi?.dockBack(id);
+});
+window.addEventListener("pdtk-combos-changed", () => syncSplitUi());
 
 document.addEventListener("click", (event) => {
   if (!event.target.closest(".combo")) closeMenus();
@@ -1562,9 +1824,19 @@ window.pdtk.onInspectState((next) => {
 async function resume() {
   const boot = await window.pdtk.boot();
   state.origin = boot.origin;
-  if (boot.settings) applyBrowserPrefs(boot.settings);
+  if (boot.settings) {
+    applyBrowserPrefs(boot.settings);
+    loadTweaksFromSettings(boot.settings);
+  }
+  initTweaks();
   document.getElementById("local-wisp").dataset.wisp = localWisp();
+  const wispInput = document.getElementById("wisp-url");
+  if (wispInput && !String(wispInput.value || "").trim()) {
+    wispInput.value = localWisp();
+  }
   syncSiteFields();
+  initCombos();
+  if (boot.settings) loadCombosFromSettings(boot.settings);
   syncSplitUi();
   syncTransportFields();
   applyDock();
@@ -1594,53 +1866,61 @@ function destinationIsLocal(url) {
 
 async function mcpStartSession(args = {}) {
   const destination = normalizeHttp(args.url || args.destination || "");
-  const split = Boolean(args.split);
-  const transport = args.transport || document.getElementById("transport").value || "epoxy";
-  // Loopback destinations must use the toolkit's local Wisp — remote Mercury Wisp
-  // cannot reach the developer's 127.0.0.1 (MCP previously hard-coded localSite:false).
   const localSite = destinationIsLocal(destination);
-  const endpoints = readEndpoints(
-    localSite,
-    transport,
-    args.wispUrl || document.getElementById("wisp-url").value,
-    args.bareUrl || document.getElementById("bare-url").value
-  );
-  if (localSite && !BARE_TRANSPORTS.has(endpoints.transport) && !String(args.wispUrl || "").trim()) {
-    endpoints.wispUrl = localWisp();
-  }
-  // Close settings so MCP screenshots/inspect see the proxy panes, not the settings sheet.
   document.getElementById("settings-close")?.click();
-  syncSplitCheckboxes(split);
-  if (args.orientation) syncSplitOrientation(args.orientation);
-  if (split) {
-    const hosts = await window.pdtk.ensureSplitHosts();
-    const leftKind = args.leftProxy || args.proxy || "scramjet";
-    const rightKind = args.rightProxy || (leftKind === "scramjet" ? "ultraviolet" : "scramjet");
+
+  const comboArgs = (Array.isArray(args.combos) ? args.combos.filter(Boolean) : []).map((combo) => ({
+    ...combo,
+    proxy: normalizeProxyKind(combo.proxy || combo.proxyKind),
+    transport: normalizeTransportId(combo.transport),
+  }));
+  let outcome = null;
+  if (state.session) await endSession().catch(() => {});
+  if (comboArgs.length) {
+    const needsBare = comboArgs.some((c) => BARE_TRANSPORTS.has(c.transport));
+    const needsWisp = comboArgs.some((c) => !BARE_TRANSPORTS.has(c.transport));
+    let wispUrl = "";
+    let bareUrl = "";
+    if (needsWisp) {
+      wispUrl = normalizeWisp(args.wispUrl || document.getElementById("wisp-url").value, defaultWisp());
+      if (localSite && !String(args.wispUrl || "").trim()) wispUrl = localWisp();
+    }
+    if (needsBare) bareUrl = normalizeBare(args.bareUrl || document.getElementById("bare-url").value);
+    const hosts = await window.pdtk.ensureComboHosts({ count: comboArgs.length });
     const session = {
-      mode: "split",
-      orientation: args.orientation === "vertical" ? "vertical" : splitOrientation(),
+      mode: "multi",
       destination,
       localSite,
-      ...endpoints,
-      panes: [
-        {
-          id: "left",
-          proxy: { kind: leftKind, label: leftKind === "ultraviolet" ? "Ultraviolet" : "Scramjet" },
-          port: hosts.leftPort,
-          origin: hosts.leftOrigin,
-        },
-        {
-          id: "right",
-          proxy: { kind: rightKind, label: rightKind === "ultraviolet" ? "Ultraviolet" : "Scramjet" },
-          port: hosts.rightPort,
-          origin: hosts.rightOrigin,
-        },
-      ],
+      wispUrl,
+      bareUrl,
+      transport: comboArgs[0].transport,
+      combos: comboArgs.map((combo, index) => {
+        const proxyKind = combo.proxy;
+        const transport = combo.transport;
+        return {
+          id: combo.id || `combo-mcp-${index + 1}`,
+          label: combo.label || formatComboChip({ proxyKind, transport, label: "" }),
+          proxy: { kind: proxyKind, label: proxyKind === "ultraviolet" ? "Ultraviolet" : "Scramjet" },
+          transport,
+          port: hosts.hosts[index].port,
+          origin: hosts.hosts[index].origin,
+        };
+      }),
     };
     await window.pdtk.setSession(session);
-    await startSession(session);
+    outcome = await startSession(session);
   } else {
-    const kind = args.proxy || "scramjet";
+    const transport = normalizeTransportId(args.transport, document.getElementById("transport").value || "epoxy-tls");
+    const endpoints = readEndpoints(
+      localSite,
+      transport,
+      args.wispUrl || document.getElementById("wisp-url").value,
+      args.bareUrl || document.getElementById("bare-url").value
+    );
+    if (localSite && !BARE_TRANSPORTS.has(endpoints.transport) && !String(args.wispUrl || "").trim()) {
+      endpoints.wispUrl = localWisp();
+    }
+    const kind = normalizeProxyKind(args.proxy);
     const session = {
       mode: "single",
       destination,
@@ -1652,7 +1932,50 @@ async function mcpStartSession(args = {}) {
     await startSession(session);
   }
   rememberTabDestination(destination);
-  return { ok: true, session: state.session };
+  const result = { ok: true, session: state.session };
+  if (state.session?.mode === "multi") {
+    result.combos = comboSummary();
+    if (outcome?.failed?.length) result.failed = outcome.failed;
+  }
+  return result;
+}
+
+function comboSummary() {
+  const active = state.multi?.activeCombo();
+  return (state.multi?.runtime.combos || []).map((combo) => ({
+    id: combo.id,
+    label: combo.label,
+    proxy: combo.proxy?.kind,
+    transport: combo.transport,
+    active: combo.id === active?.id,
+    poppedOut: Boolean(combo.poppedOut),
+    error: combo.error || undefined,
+  }));
+}
+
+function mcpNavigate(args) {
+  if (!state.session) return { ok: false, error: "No active session." };
+  const url = normalizeHttp(args.url || args.destination);
+  if (state.session.mode !== "multi") {
+    navigate(url, { fromMcp: true });
+    return { ok: true, destination: state.session.destination };
+  }
+  if (args.comboId && !state.multi.focusCombo(String(args.comboId))) {
+    return { ok: false, error: `Unknown combo "${args.comboId}".`, combos: comboSummary() };
+  }
+  if (args.allCombos) {
+    state.session.destination = url;
+    setAddressDisplay(url);
+    rememberTabDestination(url);
+    syncMainSession();
+    for (const combo of state.multi.runtime.combos) {
+      combo.bootSession = { ...combo.bootSession, destination: url };
+      state.multi.postToCombo(combo.id, { type: "pdtk-navigate", url });
+    }
+  } else {
+    navigate(url, { fromMcp: true });
+  }
+  return { ok: true, destination: url, combos: comboSummary() };
 }
 
 async function handleMcpCommand(payload) {
@@ -1662,20 +1985,25 @@ async function handleMcpCommand(payload) {
     if (command === "start_session") result = await mcpStartSession(args || {});
     else if (command === "end_session") result = await endSession();
     else if (command === "navigate") {
-      if (!state.session) result = { ok: false, error: "No active session." };
-      else {
-        navigate(args?.url || args?.destination, { fromMcp: true });
-        result = { ok: true, destination: state.session.destination };
+      result = mcpNavigate(args || {});
+    } else if (command === "focus_combo") {
+      if (state.session?.mode !== "multi") result = { ok: false, error: "No combos session is running." };
+      else if (!state.multi?.focusCombo(String(args?.comboId || ""))) {
+        result = { ok: false, error: `Unknown combo "${args?.comboId}".`, combos: comboSummary() };
+      } else {
+        result = { ok: true, active: args.comboId, combos: comboSummary() };
       }
-    } else if (command === "set_split_orientation") {
-      const orientation = args?.orientation === "vertical" ? "vertical" : "horizontal";
-      syncSplitOrientation(orientation);
-      applySplitOrientation(orientation);
-      if (state.session) {
-        state.session.orientation = orientation;
-        await window.pdtk.setSession(state.session);
+    } else if (command === "get_tweaks") {
+      result = { ok: true, tweaks: tweakSnapshot(), sessionActive: Boolean(state.session) };
+    } else if (command === "set_tweaks") {
+      const changed = await applyTweaksPatch(args || {}, { fromMcp: true });
+      const applied = changed.length ? await applyTweakChanges(changed) : { reloaded: false, verboseRestarted: false };
+      const notes = [];
+      if (state.session?.mode === "multi" && changed.some((key) => RELOAD_TWEAKS.has(key))) {
+        notes.push("Site cloaking and Load in iframe only affect single sessions; combo tabs keep running unchanged.");
       }
-      result = { ok: true, orientation };
+      if (!state.session && changed.length) notes.push("Saved. They apply when the next session starts.");
+      result = { ok: true, changed, ...applied, tweaks: tweakSnapshot(), notes };
     } else {
       result = { ok: false, error: `Unsupported command: ${command}` };
     }
@@ -1686,7 +2014,6 @@ async function handleMcpCommand(payload) {
 }
 
 document.getElementById("setup-mcp")?.addEventListener("click", () => openMcpSettings());
-
 window.pdtk.onNetwork(addStat);
 window.pdtk.onMcpCommand(handleMcpCommand);
 window.addEventListener("pdtk-settings-changed", (event) => {
@@ -1708,4 +2035,6 @@ initSettings({
   ].filter(Boolean).join(" ")).join("\n"),
   getWispLocation: () => document.getElementById("live-wisp").value || document.getElementById("wisp-url").value || localWisp(),
 }).catch((error) => setStatus(launchStatus, error.message || String(error), true));
-resume().catch((error) => setStatus(launchStatus, error.message || String(error), true));
+resume()
+  .then(() => runStartupUpdateCheck())
+  .catch((error) => setStatus(launchStatus, error.message || String(error), true));

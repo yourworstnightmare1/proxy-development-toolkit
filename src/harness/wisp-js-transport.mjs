@@ -30,6 +30,18 @@ function tuples(headers) {
   );
 }
 
+// bare-mux transports must return headers as an object; Ultraviolet reads rawHeaders["content-type"] to decide whether to rewrite.
+function headerObject(headers) {
+  const out = {};
+  for (const [rawKey, value] of tuples(headers)) {
+    const key = rawKey.toLowerCase();
+    if (!(key in out)) out[key] = value;
+    else if (Array.isArray(out[key])) out[key].push(value);
+    else out[key] = [out[key], value];
+  }
+  return out;
+}
+
 function headerMap(headers) {
   const map = new Map();
   for (const [key, value] of tuples(headers)) map.set(key.toLowerCase(), value);
@@ -210,7 +222,7 @@ export default class WispJsTransport {
     const response = await this.tls.fetch(remote.href, {
       method,
       body,
-      headers,
+      headers: headerMap(headers),
       redirect: "manual",
       signal,
     });
@@ -218,7 +230,7 @@ export default class WispJsTransport {
       body: response.body,
       status: response.status,
       statusText: response.statusText,
-      headers: tuples(response.rawHeaders || response.headers),
+      headers: headerObject(response.rawHeaders || response.headers),
     };
   }
 
@@ -249,7 +261,7 @@ export default class WispJsTransport {
       body: parsed.body,
       status: parsed.status,
       statusText: parsed.statusText,
-      headers: parsed.headers,
+      headers: headerObject(parsed.headers),
     };
   }
 
